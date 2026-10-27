@@ -1,0 +1,1 @@
+{"compilerOptions":{"target":"ES2022","module":"NodeNext","moduleResolution":"NodeNext","strict":true,"esModuleInterop":true,"skipLibCheck":true,"outDir":"build-desktop","rootDir":"."},"include":["backend/**/*.ts","electron/**/*.ts","src/contracts.ts"]}

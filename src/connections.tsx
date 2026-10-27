@@ -1,0 +1,29 @@
+﻿import React, { useEffect, useState } from 'react';
+import QRCode from 'qrcode';
+import type { NetworkView, Workspace } from './contracts';
+
+export function Connections({ workspace, api }: { workspace: Workspace; api: <T>(path: string, options?: RequestInit) => Promise<T> }) {
+  const [network, setNetwork] = useState<NetworkView | null>(null);
+  const [address, setAddress] = useState('');
+  const [role, setRole] = useState('player');
+  const [label, setLabel] = useState('');
+  const [hours, setHours] = useState(8);
+  const [projectId, setProjectId] = useState(workspace.activeId);
+  const [link, setLink] = useState('');
+  const [qr, setQr] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [copied, setCopied] = useState(false);
+  useEffect(() => { let alive = true; void api<NetworkView>('/api/network').then(value => { if (!alive) return; setNetwork(value); setAddress(value.address || value.interfaces[0]?.address || ''); }).catch(err => { if (alive) setError(err.message); }); return () => { alive = false; }; }, [api]);
+  useEffect(() => { let alive = true; setCopied(false); if (!link) { setQr(''); return; } void QRCode.toDataURL(link, { width: 256, margin: 2, errorCorrectionLevel: 'M' }).then(value => { if (alive) setQr(value); }).catch(() => setError('Не удалось создать QR-код')); return () => { alive = false; }; }, [link]);
+  async function post(path: string, value: unknown) {
+    setBusy(true); setError('');
+    try { const data = await api<NetworkView>(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value) }); setNetwork(data); if (data.link) setLink(data.link); else if (path === '/api/network' || path.endsWith('/revoke')) setLink(''); }
+    catch (err) { setError(err instanceof Error ? err.message : 'Ошибка подключения'); }
+    finally { setBusy(false); }
+  }
+  return <div className="connections-editor">{error && <p role="alert" className="error-banner">{error}</p>}<div className="settings-grid"><section className="editor-card"><h2>Локальная сеть</h2><p>Компьютер и телефоны должны быть в одной доверенной Wi-Fi сети. Подключение использует HTTP.</p><label>Сетевой интерфейс<select disabled={busy} value={address} onChange={e => setAddress(e.target.value)}>{network?.interfaces.map(item => <option key={item.address} value={item.address}>{item.name} · {item.address}</option>)}</select></label><button className="primary" disabled={busy || !address} onClick={() => void post('/api/network', { enabled: !network?.enabled, address })}>{network?.enabled ? 'Выключить сетевые подключения' : 'Включить локальную сеть'}</button>{network?.enabled && <p>Сервер запущен: {network.url}</p>}{network && !network.interfaces.length && <p>Не найден частный IPv4-адрес. Подключите компьютер к локальной сети.</p>}<p>Если телефон не подключается, проверьте одну Wi-Fi сеть, гостевую изоляцию роутера и разрешение Arcane Table в брандмауэре Windows.</p></section>
+    <section className="editor-card"><h2>Приглашение</h2><label>Роль<select value={role} onChange={e => setRole(e.target.value)}><option value="player">Игрок — только свой персонаж</option><option value="master">Мастер — управление кампанией</option><option value="display">Экран — только презентация</option></select></label><label>Название подключения<input aria-label="Имя подключения" value={label} maxLength={100} onChange={e => setLabel(e.target.value)} placeholder="Например, Алексей"/></label>{role === 'player' && <label>Кампания игрока<select value={projectId} onChange={e => setProjectId(e.target.value)}>{workspace.projects.map(project => <option key={project.id} value={project.id}>{project.name}</option>)}</select></label>}<label>Действует<select value={hours} onChange={e => setHours(Number(e.target.value))}>{[1,4,8,24,72,168].map(value => <option key={value} value={value}>{value} ч.</option>)}</select></label><button disabled={busy || !network?.enabled || !label.trim()} onClick={() => void post('/api/connections/create', { role, label, hours, projectId })}>Создать ссылку и QR</button></section></div>
+    {link && <section className="editor-card invitation-card"><div>{qr && <img src={qr} width="256" height="256" alt="QR-код приглашения"/>}</div><div><h2>Откройте на устройстве</h2><p>Эта ссылка даёт выбранную роль. Передайте её нужному участнику; доступ можно отозвать ниже.</p><input aria-label="Ссылка приглашения" readOnly value={link}/><button onClick={() => { void navigator.clipboard.writeText(link).then(() => setCopied(true)).catch(() => setError('Скопируйте ссылку из поля вручную')); }}>{copied ? 'Скопировано' : 'Скопировать ссылку'}</button></div></section>}
+    <section className="editor-card"><div className="section-heading"><h2>Устройства и доступ</h2><button disabled={busy} onClick={() => { void api<NetworkView>('/api/network').then(setNetwork).catch(err => setError(err.message)); }}>Обновить статус</button></div>{network?.connections.length === 0 && <p>Создайте отдельное приглашение для каждого игрока.</p>}<div className="connection-list">{network?.connections.map(item => <div key={item.id}><div><strong>{item.label}</strong><p>{item.role === 'player' ? 'Игрок' : item.role === 'master' ? 'Мастер' : 'Экран'} · {item.active ? item.online ? 'В сети' : 'Ожидает подключения' : 'Доступ завершён'}</p>{item.playerName && <p>{item.playerName} {item.characterId ? `· ${item.characterId}` : ''}</p>}<small>До {new Date(item.expiresAt).toLocaleString('ru-RU')}</small></div><div className="action-row">{item.characterId && <button disabled={busy || !item.active} onClick={() => void post('/api/connections/release', { id: item.id })}>Освободить персонажа</button>}<button disabled={busy || !item.active} onClick={() => void post('/api/connections/revoke', { id: item.id })}>Отозвать доступ</button></div></div>)}</div></section></div>;
+}

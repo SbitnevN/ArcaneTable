@@ -1,0 +1,80 @@
+{
+  "name": "arcane-table",
+  "private": true,
+  "version": "0.3.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc --noEmit && tsc -p tsconfig.backend.json && vite build",
+    "preview": "vite preview --host 127.0.0.1",
+    "desktop": "npm run setup:desktop && npm run build && electron .",
+    "test": "tsc -p tsconfig.backend.json && node --test tests/*.test.mjs",
+    "setup:desktop": "node node_modules/electron/install.js",
+    "test:desktop": "npm run setup:desktop && npm run build && electron . --smoke-test",
+    "dist:win": "npm run setup:desktop && npm run build && electron-builder --win nsis --x64",
+    "pack:win": "npm run setup:desktop && npm run build && electron-builder --win --x64 --dir",
+    "test:combat-ui": "npm run setup:desktop && npm run build && electron . --smoke-test --combat-smoke"
+  },
+  "dependencies": {
+    "image-size": "^2.0.4",
+    "qrcode": "^1.5.4",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "sql.js": "^1.15.2",
+    "ws": "^8.22.0",
+    "yauzl": "^3.4.0",
+    "yazl": "^3.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "@types/qrcode": "^1.5.6",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@types/sql.js": "^1.4.11",
+    "@types/ws": "^8.18.2",
+    "@types/yauzl": "^3.4.0",
+    "@types/yazl": "^3.3.1",
+    "ajv": "^8.20.0",
+    "electron": "^45.0.0",
+    "electron-builder": "^26.18.0",
+    "typescript": "^5.7.0",
+    "vite": "^6.0.0"
+  },
+  "main": "build-desktop/electron/main.js",
+  "description": "Локальный игровой стол и мастерская кампаний",
+  "build": {
+    "appId": "local.arcanetable.desktop",
+    "productName": "Arcane Table",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "build-desktop/**/*",
+      "electron/preload.cjs",
+      "package.json"
+    ],
+    "asarUnpack": [
+      "**/*.wasm"
+    ],
+    "electronDist": "node_modules/electron/dist",
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "signAndEditExecutable": false
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "deleteAppDataOnUninstall": false,
+      "artifactName": "Arcane-Table-${version}-x64-Setup.${ext}"
+    }
+  }
+}
