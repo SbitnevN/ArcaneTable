@@ -84,3 +84,44 @@ test('Prepared encounters are archived and can be reopened without losing partic
   assert.equal(combat().name, 'Засада'); assert.equal(combat().participants.length, 2);
   assert.equal(store.state().projects[0].encounters[0].name, 'Второй бой');
 }));
+
+test('Actions keep their actual source through approval and hide events from hidden attackers', async () => fixture(store => {
+  const { run, combat, hero, enemy, projectId } = setup(store);
+  run('combat.start');
+  run('combat.damage', { sourceId: enemy.id, targetId: hero.id, amount: 2 });
+  let event = combat().events.at(-1);
+  assert.equal(event.sourceId, enemy.id); assert.equal(event.targetId, hero.id); assert.ok(event.at > 0);
+  assert.equal(store.publicView().combat.events.at(-1).sourceId, enemy.id);
+  const before = combat();
+  assert.throws(() => run('combat.damage', { sourceId: 'missing', targetId: hero.id, amount: 2 }));
+  assert.deepEqual(combat(), before);
+  run('combat.mode', { approval: true });
+  const requestId = randomUUID();
+  store.execute({ id: requestId, type: 'combat.request', projectId, characterId: hero.characterId, targetId: enemy.id, kind: 'damage', amount: 1 });
+  run('combat.active', { participantId: enemy.id });
+  run('combat.approve', { requestId });
+  event = combat().events.at(-1); assert.equal(event.sourceId, hero.id);
+  run('combat.update', { participantId: enemy.id, participant: { visible: false } });
+  const serialized = JSON.stringify(store.publicView().combat);
+  assert.ok(!serialized.includes(enemy.id)); assert.ok(!serialized.includes(enemy.name));
+}));
+
+test('Starting combat publishes its project, replaces a shop and preserves the table background', async () => fixture(store => {
+  const { run, projectId } = setup(store);
+  const initial = store.state().projects[0];
+  run('shop.show', { shopId: initial.shops[0].id });
+  store.execute({ id: randomUUID(), type: 'project.create', name: 'Другой эфир' });
+  const otherId = store.state().activeId;
+  store.execute({ id: randomUUID(), type: 'project.live', projectId: otherId });
+  assert.equal(store.publicView().projectName, 'Другой эфир');
+  run('combat.start');
+  assert.equal(store.state().liveId, projectId);
+  assert.equal(store.publicView().combat.running, true);
+  assert.equal(store.publicView().shop, null);
+  assert.equal(store.publicView().scene.id, initial.sceneId);
+  assert.ok(!Object.hasOwn(store.publicView(), 'party'));
+  run('combat.stop');
+  const party = store.publicView().party;
+  assert.equal(party.length, initial.characters.length);
+  assert.ok(party.every(item => item.side === 'ally' && !Object.hasOwn(item, 'blocks') && item.maxHp === initial.games[item.characterId].maxHp), 'the hand shows an HP bar, so max HP is public; sheet blocks are not');
+}));

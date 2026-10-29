@@ -100,6 +100,13 @@ test('LAN role links, player commands, realtime privacy, reconnect and revocatio
     assert.equal(service.store.state().projects.find(p => p.id === projectId).combat.participants.find(p => p.id === enemy.id).hp, 345);
     const approved = await (await fetch(network.url + '/api/player', { headers: auth })).json(); assert.equal(approved.pendingAction, false);
     assert.ok(!Object.hasOwn(approved.combat, 'history'));
+    run('combat.add', { characterId: 'tarkhun' }); run('combat.mode', { approval: false });
+    const ally = service.store.state().projects.find(p => p.id === projectId).combat.participants.find(p => p.characterId === 'tarkhun');
+    const friendly = await fetch(network.url + '/api/player/command', { method: 'POST', headers: auth, body: JSON.stringify({ id: randomUUID(), type: 'player.action', targetId: ally.id, kind: 'damage', amount: 2 }) });
+    assert.equal(friendly.status, 200); assert.equal((await friendly.json()).combat.participants.find(p => p.id === ally.id).hp, 26);
+    run('combat.active', { participantId: enemy.id });
+    const outOfTurn = await fetch(network.url + '/api/player/command', { method: 'POST', headers: auth, body: JSON.stringify({ id: randomUUID(), type: 'player.action', targetId: ally.id, kind: 'damage', amount: 2 }) });
+    assert.equal(outOfTurn.status, 400); assert.equal(service.store.state().projects.find(p => p.id === projectId).games.tarkhun.hp, 26);
     const connectionId = a.connections.find(item => item.label === 'А').id;
     await rootPost('/api/connections/revoke', { id: connectionId });
     assert.equal((await fetch(network.url + '/api/player', { headers: auth })).status, 401);

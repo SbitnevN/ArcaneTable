@@ -4,3 +4,5 @@ dist/
 
 .arcane-data/
 build-desktop/
+output/
+llmdebug.db

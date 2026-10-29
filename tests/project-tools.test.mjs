@@ -15,9 +15,16 @@ test('Scene presets restore geometry; master notes stay private and cues expire'
     run('project.notes',{ text:'ПРИВАТНОЕ: секрет мастера' }); run('project.live'); run('preset.save',{ name:'Исходная сцена' });
     const presetId = store.state().projects[0].presets[0].id;
     run('layout.update',{ target:'card',layout:{ scale:1.5,x:30,y:70 } }); run('character.select',{ characterId:'paladin' });
-    run('preset.apply',{ presetId }); assert.deepEqual(store.state().projects[0].layout,{ scale:1,x:50,y:50 }); assert.equal(store.state().projects[0].selectedCharacter,'aristocrat');
+    run('preset.apply',{ presetId }); assert.deepEqual(store.state().projects[0].layout,{ scale:1,x:50,y:80 }); assert.equal(store.state().projects[0].selectedCharacter,'aristocrat');
     run('cue.show',{ name:'Начало новой главы' }); assert.equal(store.publicView().cue.label,'Начало новой главы'); assert.ok(!JSON.stringify(store.publicView()).includes('ПРИВАТНОЕ'));
     const now = Date.now; try { Date.now = () => now()+7000; assert.equal(store.publicView().cue,null); } finally { Date.now = now; }
+    run('cue.show',{ name:'Голос из тьмы',text:'Строка один\nСтрока два',count:0 }); assert.equal(store.publicView().cue.text,'Строка один\nСтрока два');
+    try { Date.now = () => now()+86400000; assert.equal(store.publicView().cue.label,'Голос из тьмы'); } finally { Date.now = now; }
+    run('cue.hide'); assert.equal(store.publicView().cue,null);
+    const heroes = () => store.publicView().party.map(item => item.characterId);
+    run('character.offstage',{ characterId:'paladin',visible:false }); assert.ok(!heroes().includes('paladin')); assert.ok(heroes().includes('tarkhun'));
+    run('character.offstage',{ characterId:'paladin',visible:true }); assert.ok(heroes().includes('paladin')); assert.equal(store.state().projects[0].characters.find(c => c.id === 'paladin').offstage,undefined);
+    assert.throws(() => run('cue.show',{ name:'Длинно',text:'а'.repeat(1001) }),/1000/); assert.throws(() => run('cue.show',{ name:'Долго',count:-1 }),/Длительность/);
     const restored = await Store.open(directory); try { assert.equal(restored.state().projects[0].dmNotes,'ПРИВАТНОЕ: секрет мастера'); } finally { restored.close(); }
   } finally { store.close(); rmSync(directory,{ recursive:true,force:true,maxRetries:5,retryDelay:100 }); }
 });
