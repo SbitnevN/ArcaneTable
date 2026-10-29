@@ -1,45 +1,108 @@
-﻿import { PlayerShop } from './shop';
+﻿import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { PlayerShop, Purse } from './shop';
 import { ReferenceLibrary } from './references';
-import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { newId, type Game, type PlayerView } from './contracts';
+import { newId, type Ability, type Game, type PlayerView } from './contracts';
+import { abilities, effectGroup, effectSentence, effectText, effectiveStats, modifier, parseSkills, proficiency, signed, skills, type EffectiveStats } from './library';
+import { PlayerNotesEditor, PlayerSheet } from './player-sheet';
+import { PlayerAttacks } from './player-attacks';
+import { applyTheme, storedTheme, themes, type ThemeId } from './themes';
+import { Modal } from './ui';
+import { Icon } from './icons';
+import { PlayerCombat } from './player-combat';
+import { InventoryGrid } from './inventory';
+import { PlayerLoot } from './loot';
 
 export function Player({ api, subscribe }: { api: <T>(path: string, options?: RequestInit) => Promise<T>; subscribe: (ready: boolean, callback: () => void) => void }) {
   const [view, setView] = useState<PlayerView | null>(null);
   const [name, setName] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [tab, setTab] = useState('hero');
+  const [dialog, setDialog] = useState<'sheet' | 'switch' | null>(null);
+  const [heroTab, setHeroTab] = useState<'stats' | 'features' | 'attacks' | 'gear'>('stats');
+  const [theme, setTheme] = useState<ThemeId>(storedTheme);
+  useEffect(() => applyTheme(theme), [theme]);
   const busyRef = useRef(false);
   const refresh = useCallback(() => { if (busyRef.current) return; void api<PlayerView>('/api/player').then(value => { if (!busyRef.current) { setView(value); setError(''); setName(current => current || value.playerName); } }).catch(err => setError(err.message)); }, [api]);
   useEffect(refresh, [refresh]);
   subscribe(true, refresh);
-  async function post(path: string, value: unknown) {
-    if (busyRef.current) return;
+  async function post(path: string, value: unknown): Promise<boolean> {
+    if (busyRef.current) return false;
     busyRef.current = true; setBusy(true); setError('');
-    try { setView(await api<PlayerView>(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value) })); }
-    catch (err) { setError(err instanceof Error ? err.message : 'Не удалось сохранить'); }
+    try { setView(await api<PlayerView>(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value) })); return true; }
+    catch (err) { setError(err instanceof Error ? err.message : 'Не удалось сохранить'); return false; }
     finally { busyRef.current = false; setBusy(false); }
   }
   const character = view?.characters.find(item => item.id === view.own?.characterId);
-  return <div className="mobile-player"><header><span>✦ ARCANE TABLE</span><small>{view?.projectName || 'Подключение'}</small></header><main>{error && <p className="error-banner" role="alert">{error}<button disabled={busy} onClick={refresh}>Переподключиться</button></p>}{!view ? <p>Подключаемся к мастеру…</p> : !view.own ? <><h1>Ваш персонаж</h1><p>Введите имя и выберите свободную карту.</p><label>Имя игрока<input aria-label="Имя игрока" value={name} maxLength={100} onChange={e => setName(e.target.value)} autoComplete="nickname"/></label><div className="player-roster">{view.characters.map(item => <button key={item.id} disabled={busy || item.occupied || !name.trim()} onClick={() => void post('/api/player/claim', { characterId: item.id, name })}><img src={item.image} alt=""/><strong>{item.name}</strong><span>{item.occupied ? 'Занят' : 'Выбрать'}</span></button>)}</div></> : <><div className="mobile-character-heading"><h1>{character?.name}</h1><p>{view.playerName}</p></div>{character && <img className="mobile-portrait" src={character.image} alt={character.name}/>}<section className="editor-card"><h2>Хиты и защита</h2><div className="mobile-stats"><div><strong>{view.own.game.hp}<small> / {view.own.game.maxHp}</small></strong><span>ХП</span></div><div><strong>{view.own.game.ac}</strong><span>КД</span></div></div><div className="mobile-hp-actions"><button disabled={busy || view.own.game.hp === 0} onClick={() => void post('/api/player/command', { id: newId(), type: 'player.update', hp: Math.max(0, view.own!.game.hp - 1) })}>−1 ХП</button><button disabled={busy || view.own.game.hp === view.own.game.maxHp} onClick={() => void post('/api/player/command', { id: newId(), type: 'player.update', hp: Math.min(view.own!.game.maxHp, view.own!.game.hp + 1) })}>+1 ХП</button></div><label>Текущие ХП<input aria-label="Текущие ХП игрока" type="number" min="0" max={view.own.game.maxHp} disabled={busy} key={`${view.own.characterId}-${view.own.game.hp}`} defaultValue={view.own.game.hp} onBlur={e => { const hp = Number(e.target.value); if (e.target.value !== '' && Number.isSafeInteger(hp) && hp >= 0 && hp <= view.own!.game.maxHp && hp !== view.own!.game.hp) void post('/api/player/command', { id: newId(), type: 'player.update', hp }); }}/></label><p role="status">{busy ? 'Сохранение…' : 'Изменения сохраняются у мастера'}</p></section>{view.shop && <PlayerShop shop={view.shop}/>}<PlayerSheet game={view.own.game} busy={busy} post={post}/><PlayerCombat view={view} busy={busy} post={post}/><section className="editor-card"><h2>Мои заметки и способности</h2>{view.own.game.blocks.length === 0 && <p>Пока нет записей.</p>}{view.own.game.blocks.map(block => block.kind === 'text' ? <article key={block.id}><h3>{block.title}</h3><p className="block-text">{block.text}</p></article> : <details key={block.id}><summary>{block.kind === 'spoiler' ? '◈ ' : ''}{block.title || 'Подробнее'}</summary><p className="block-text">{block.text}</p></details>)}</section><details className="player-encyclopedia editor-card"><summary>Заклинания SRD</summary><ReferenceLibrary kind="spells"/></details><details className="player-switch"><summary>Сменить персонажа</summary><p>Текущий персонаж освободится после выбора нового.</p>{view.characters.filter(item => item.id !== character?.id).map(item => <button key={item.id} disabled={busy || item.occupied} onClick={() => void post('/api/player/claim', { characterId: item.id, name: view.playerName || name })}>{item.name}{item.occupied ? ' · занят' : ''}</button>)}</details></> }</main></div>;
+  const game = view?.own?.game;
+  const stats = game ? effectiveStats(game, view?.catalog) : null;
+  const tabs = [
+    { id: 'hero', label: 'Герой', icon: '♙' },
+    { id: 'combat', label: 'Бой', icon: '⚔' },
+    { id: 'notes', label: 'Заметки', icon: '≡' },
+    ...(view?.shop ? [{ id: 'shop', label: 'Лавка', icon: '♧' }] : [])
+  ];
+  const activeTab = tabs.some(item => item.id === tab) ? tab : 'hero';
+  return <div className="mobile-player player-app"><header className="player-app-header"><div className="player-wordmark">✦ <span>ARCANE TABLE<small>{view?.projectName || 'Подключение к столу'}</small></span></div>{character && <div className="player-identity"><img src={character.image} alt=""/><span>{character.name}<small>{view?.playerName}</small></span></div>}</header>
+    {view?.own && <nav className="player-tabs" role="tablist" aria-label="Разделы игрока">{tabs.map((item, index) => <button type="button" key={item.id} role="tab" id={`player-tab-${item.id}`} aria-controls={`player-panel-${item.id}`} aria-selected={activeTab === item.id} tabIndex={activeTab === item.id ? 0 : -1} onClick={() => { setTab(item.id); window.scrollTo(0, 0); }} onKeyDown={e => {
+      if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) return;
+      e.preventDefault(); const next = e.key === 'Home' ? 0 : e.key === 'End' ? tabs.length - 1 : (index + (e.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+      setTab(tabs[next].id); window.scrollTo(0, 0); document.getElementById(`player-tab-${tabs[next].id}`)?.focus();
+    }}><span aria-hidden="true">{item.icon}</span>{item.label}{item.id === 'combat' && view.combat?.running && <i aria-label="Идёт бой"/>}{item.id === 'hero' && view.combat?.loot?.turn === view.own?.characterId && <i aria-label="Ваш выбор добычи"/>}</button>)}</nav>}
+    <main>{error && <div className="error-banner" role="alert">{error}<button disabled={busy} onClick={refresh}>Переподключиться</button></div>}{!view ? <section className="player-empty"><span>✦</span><p>Подключаемся к мастеру…</p></section> : !view.own ? <section className="player-claim"><span className="player-kicker">ДОБРО ПОЖАЛОВАТЬ ЗА СТОЛ</span><h1>Выберите своего героя</h1><p>Карта станет вашим листом персонажа и рукой в бою.</p><label>Имя игрока<input aria-label="Имя игрока" value={name} maxLength={100} onChange={e => setName(e.target.value)} autoComplete="nickname"/></label><div className="player-roster">{view.characters.map(item => <button key={item.id} disabled={busy || item.occupied || !name.trim()} onClick={() => void post('/api/player/claim', { characterId: item.id, name })}><img src={item.image} alt=""/><strong>{item.name}</strong><span>{item.occupied ? 'Занят' : 'Выбрать героя'}</span></button>)}</div></section> : game && <>
+      <section id="player-panel-hero" role="tabpanel" aria-labelledby="player-tab-hero" hidden={activeTab !== 'hero'}>
+        <div className="player-section-heading"><div><span className="player-kicker">ВАШ ПЕРСОНАЖ</span><h1>{character?.name}</h1><p>{[game.race, game.className].filter(Boolean).join(' · ') || character?.caption}</p></div><span className="player-level">{game.level || 1}<small>уровень</small></span><button type="button" className="player-edit-sheet" aria-label="Редактировать лист" title="Редактировать лист" disabled={busy} onClick={() => setDialog('sheet')}><Icon name="edit"/></button></div>
+        <div className="player-subtabs" role="tablist" aria-label="Разделы героя">{([['stats', 'Статы'], ['features', 'Умения'], ['attacks', 'Атаки'], ['gear', 'Снаряжение']] as const).map(([id, label]) => <button type="button" role="tab" key={id} aria-selected={heroTab === id} className={heroTab === id ? 'active' : ''} onClick={() => setHeroTab(id)}>{label}{id === 'features' && (game.features || []).length > 0 && <small>{game.features!.length}</small>}{id === 'gear' && view.combat?.loot?.turn === view.own?.characterId && <i aria-label="Ваш выбор добычи"/>}</button>)}</div>
+        {heroTab === 'stats' && <>
+        <section className="player-hero-overview">{character && <img className="player-hero-art" src={character.image} alt={character.name}/>}<div className="player-hero-values"><div className="player-health"><span>ХИТЫ</span><strong>{game.hp}<small> / {game.maxHp}</small></strong><div className="player-health-track"><i style={{ width: `${game.hp / game.maxHp * 100}%` }}/></div></div><div className="player-defense"><span>КД</span><strong className={stats?.changed.ac !== undefined ? 'boosted' : undefined}>{stats?.ac ?? game.ac}</strong></div>
+          <HpControl hp={game.hp} maxHp={game.maxHp} busy={busy} onSet={hp => void post('/api/player/command', { id: newId(), type: 'player.update', hp })}/></div></section>
+        <Purse coins={game.coins} busy={busy} onChange={coins => void post('/api/player/command', { id: newId(), type: 'player.update', sheet: { coins } })}/>
+        <div className="player-ability-strip">{[['str','СИЛ'],['dex','ЛОВ'],['con','ТЕЛ'],['int','ИНТ'],['wis','МДР'],['cha','ХАР']].map(([key,label]) => { const score = stats?.abilities[key as Ability] ?? game.abilities?.[key] ?? 10; const mod = Math.floor((score - 10) / 2); return <div key={key}><span>{label}</span><strong>{mod >= 0 ? '+' : ''}{mod}</strong><small>{score}</small></div>; })}</div>
+        {stats && stats.active.length > 0 && <div className="player-effects"><span>ОТ ПРЕДМЕТОВ</span>{stats.active.map((entry, index) => <span key={index} className={`effect-chip fx-${effectGroup(entry.effect)}`} title={`${entry.item}: ${effectSentence(entry.effect)}`}>{effectText(entry.effect)}</span>)}</div>}
+        {stats && <HeroSkills game={game} stats={stats}/>}
+        </>}
+        {heroTab === 'attacks' && <><PlayerAttacks game={game} busy={busy} post={post} spells={view.spells}/><details className="player-encyclopedia player-paper"><summary>Справочник заклинаний SRD</summary><ReferenceLibrary kind="spells"/></details></>}
+        {heroTab === 'gear' && <><Purse coins={game.coins} busy={busy} onChange={coins => void post('/api/player/command', { id: newId(), type: 'player.update', sheet: { coins } })}/>{view.combat?.loot && <PlayerLoot loot={view.combat.loot} characterId={view.own.characterId} busy={busy} post={post}/>}<section className="player-paper player-inventory"><InventoryGrid items={game.items || []} catalog={view.catalog || []} busy={busy} slots={20} allowEffects onChange={items => void post('/api/player/command', { id: newId(), type: 'player.update', sheet: { items } })}/>{game.inventory && <details className="player-inventory-notes"><summary>Заметки об инвентаре</summary><p className="block-text">{game.inventory}</p></details>}</section></>}
+        {heroTab === 'features' && <section className="player-paper player-features"><h2>Умения и черты</h2>{(game.features || []).length === 0 ? <p className="ui-note">Умений пока нет: их можно добавить карандашом в шапке.</p> : game.features!.map(feature => <details key={feature.id}><summary>{feature.name || 'Без названия'}</summary>{feature.text && <p className="block-text">{feature.text}</p>}</details>)}</section>}
+        <button type="button" className="player-switch-button" disabled={busy} onClick={() => setDialog('switch')}>Сменить персонажа</button>
+        <label className="player-theme">Оформление<select aria-label="Цветовая схема" value={theme} onChange={e => setTheme(e.target.value as ThemeId)}>{themes.map(item => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>
+        {dialog === 'sheet' && <PlayerSheet game={game} busy={busy} post={post} catalog={view.catalog} onClose={() => setDialog(null)}/>}
+        {dialog === 'switch' && <Modal title="Сменить персонажа" subtitle="Текущий герой освободится для других игроков" onClose={() => setDialog(null)}><div className="player-roster">{view.characters.filter(item => item.id !== character?.id).map(item => <button type="button" key={item.id} disabled={busy || item.occupied} onClick={() => void post('/api/player/claim', { characterId: item.id, name: view.playerName || name }).then(ok => { if (ok) { setDialog(null); setTab('hero'); } })}><img src={item.image} alt=""/><strong>{item.name}</strong><span>{item.occupied ? 'Занят' : 'Выбрать героя'}</span></button>)}</div></Modal>}
+      </section>
+      <section id="player-panel-combat" role="tabpanel" aria-labelledby="player-tab-combat" hidden={activeTab !== 'combat'}>{view.combat?.loot && <PlayerLoot loot={view.combat.loot} characterId={view.own.characterId} busy={busy} post={post}/>}<PlayerCombat view={view} busy={busy} post={post}/></section>
+      <section id="player-panel-notes" role="tabpanel" aria-labelledby="player-tab-notes" hidden={activeTab !== 'notes'}><div className="player-section-heading"><div><span className="player-kicker">ЛИЧНЫЙ ЖУРНАЛ</span><h1>Заметки и способности</h1></div></div><section className="player-paper">{game.blocks.length === 0 && <p>Пока нет записей.</p>}{game.blocks.map(block => block.kind === 'text' ? <article key={block.id}><h2>{block.title}</h2><p className="block-text">{block.text}</p></article> : <details key={block.id}><summary>{block.title || 'Подробнее'}</summary><p className="block-text">{block.text}</p></details>)}</section><PlayerNotesEditor game={game} busy={busy} post={post}/></section>
+      {view.shop && <section id="player-panel-shop" role="tabpanel" aria-labelledby="player-tab-shop" hidden={activeTab !== 'shop'}><div className="player-section-heading"><div><span className="player-kicker">ТОРГОВЛЯ</span><h1>Лавка</h1></div></div><PlayerShop shop={view.shop} coins={game.coins} busy={busy} onBuy={(itemId, amount) => post('/api/player/command', { id: newId(), type: 'player.buy', shopId: view.shop!.id, itemId, amount })}/></section>}
+      <p className="player-save-state" role="status">{busy ? 'Сохранение…' : 'Синхронизировано с мастером'}</p>
+    </>}</main></div>;
 }
 
-function PlayerCombat({ view, busy, post }: { view: PlayerView; busy: boolean; post: (path: string, value: unknown) => Promise<void> }) {
-  const [targetId, setTargetId] = useState('');
-  const [amount, setAmount] = useState(1);
-  const combat = view.combat;
-  if (!combat?.running || !view.own) return null;
-  const own = combat.participants.find(item => item.characterId === view.own?.characterId);
-  const active = combat.participants.find(item => item.id === combat.activeId);
-  const target = combat.participants.find(item => item.id === targetId) || combat.participants.find(item => item.side === 'enemy') || combat.participants[0];
-  const ownTurn = own?.id === combat.activeId;
-  return <section className="editor-card"><h2>{combat.name}</h2><p>Раунд {combat.round} · {ownTurn ? 'Ваш ход' : active ? `Ход: ${active.name}` : 'Мастер ведёт бой'}</p><label>Цель<select value={target?.id || ''} onChange={e => setTargetId(e.target.value)}>{combat.participants.map(item => <option key={item.id} value={item.id}>{item.name}{item.hp === undefined ? '' : ` · ХП ${item.hp}`}</option>)}</select></label><label>Величина действия<input type="number" min="1" max="1000000" value={amount} onChange={e => setAmount(Number(e.target.value))}/></label><div className="mobile-hp-actions"><button disabled={busy || !ownTurn || !target || view.pendingAction} onClick={() => void post('/api/player/command', { id: newId(), type: 'player.action', targetId: target?.id, kind: 'damage', amount })}>Нанести урон</button><button disabled={busy || !ownTurn || !target || view.pendingAction} onClick={() => void post('/api/player/command', { id: newId(), type: 'player.action', targetId: target?.id, kind: 'heal', amount })}>Лечить</button></div>{view.pendingAction && <p role="status">Запрос ожидает решения мастера.</p>}<div className="mobile-combat-log">{combat.events.slice(-5).map(event => <p key={event.id}>{event.label}</p>)}</div></section>;
+// Current hit points: −1 / +1 buttons and a number field that saves on Enter or when it loses focus.
+function HpControl({ hp, maxHp, busy, onSet }: { hp: number; maxHp: number; busy: boolean; onSet: (hp: number) => void }) {
+  const commit = (input: HTMLInputElement) => { const value = Number(input.value); if (input.value !== '' && Number.isSafeInteger(value) && value >= 0 && value <= maxHp && value !== hp) onSet(value); else input.value = String(hp); };
+  return <div className="player-hp-control">
+    <button type="button" aria-label="Уменьшить ХП на 1" disabled={busy || hp === 0} onClick={() => onSet(Math.max(0, hp - 1))}>−</button>
+    <input aria-label="Текущие ХП игрока" type="number" inputMode="numeric" min="0" max={maxHp} disabled={busy} key={hp} defaultValue={hp} onBlur={e => commit(e.currentTarget)} onKeyDown={e => { if (e.key === 'Enter') e.currentTarget.blur(); }}/>
+    <button type="button" aria-label="Увеличить ХП на 1" disabled={busy || hp === maxHp} onClick={() => onSet(Math.min(maxHp, hp + 1))}>＋</button>
+  </div>;
 }
 
-function PlayerSheet({ game, busy, post }: { game: Game; busy: boolean; post: (path: string, value: unknown) => Promise<void> }) {
-  const sheet = { level: game.level || 1, race: game.race || '', className: game.className || '', speed: game.speed ?? 30, abilities: game.abilities || {}, inventory: game.inventory || '', spells: game.spells || [], spellBook: game.spellBook || [] };
-  return <details className="editor-card player-sheet"><summary>Редактировать мой лист</summary><form key={JSON.stringify(sheet)} onSubmit={e => {
-    e.preventDefault(); const form = new FormData(e.currentTarget);
-    const updated = { level: Number(form.get('level')), race: String(form.get('race')), className: String(form.get('className')), speed: Number(form.get('speed')), abilities: Object.fromEntries(['str','dex','con','int','wis','cha'].map(key => [key, Number(form.get(key))])), inventory: String(form.get('inventory')), spells: String(form.get('spells')).split('\n').filter(Boolean), spellBook: String(form.get('spellBook')).split('\n').filter(Boolean) };
-    void post('/api/player/command', { id: newId(), type: 'player.update', sheet: updated });
-  }}><p>D&D {game.edition || '2024'}. ХП и КД настраивает мастер; содержимое листа можно изменить здесь.</p><label>Уровень<input name="level" type="number" min="1" max="20" required defaultValue={sheet.level}/></label><label>Раса<input name="race" maxLength={200} defaultValue={sheet.race}/></label><label>Класс<input name="className" maxLength={200} defaultValue={sheet.className}/></label><label>Скорость<input name="speed" type="number" min="0" max="10000" required defaultValue={sheet.speed}/></label><div className="ability-fields">{[['str','Сила'],['dex','Ловкость'],['con','Телосложение'],['int','Интеллект'],['wis','Мудрость'],['cha','Харизма']].map(([key,label]) => <label key={key}>{label}<input name={key} type="number" min="1" max="30" required defaultValue={sheet.abilities[key] ?? 10}/></label>)}</div><label>Инвентарь<textarea name="inventory" maxLength={100000} rows={5} defaultValue={sheet.inventory}/></label><label>Подготовленные заклинания<textarea name="spells" rows={4} defaultValue={sheet.spells.join('\n')}/></label><label>Книга заклинаний<textarea name="spellBook" rows={4} defaultValue={sheet.spellBook.join('\n')}/></label><button disabled={busy}>Сохранить лист</button></form><form key={JSON.stringify(game.blocks)} onSubmit={e => { e.preventDefault(); const data = new FormData(e.currentTarget); const blocks = game.blocks.map((b, i) => ({ ...b, title: String(data.get(`title-${i}`)), text: String(data.get(`text-${i}`)) })); void post('/api/player/command', { id: newId(), type: 'player.update', blocks }); }}><h3>Заметки</h3>{game.blocks.map((block, index) => <label key={block.id}><input aria-label={`Заголовок заметки ${index + 1}`} name={`title-${index}`} maxLength={500} defaultValue={block.title}/><textarea aria-label={`Текст заметки ${index + 1}`} name={`text-${index}`} maxLength={50000} rows={4} defaultValue={block.text}/></label>)}{game.blocks.length > 0 && <button disabled={busy}>Сохранить заметки</button>}</form></details>;
+// Saves and skills with their final bonuses, effects of equipped items included; proficiency is read from the sheet text.
+function HeroSkills({ game, stats }: { game: Game; stats: EffectiveStats }) {
+  const pb = proficiency(game.level || 1);
+  const base = { str: 10, dex: 10, con: 10, int: 10, wis: 10, cha: 10, ...game.abilities };
+  const { profs, extra } = parseSkills(game.skills || '', base, pb);
+  const mod = (key: Ability) => modifier(stats.abilities[key]);
+  // Grouped by ability: bold heading with the modifier, then the saving throw and that ability's skills.
+  const row = (key: string, label: string, bonus: number, level: number) => <li key={key} className={level === 2 ? 'expert' : level ? 'proficient' : undefined}><i aria-label={level === 2 ? 'Экспертиза' : level ? 'Владение' : undefined}/><span>{label}</span><b>{signed(bonus)}</b></li>;
+  return <section className="player-paper player-skills">
+    <h2>Спасброски и навыки</h2>
+    <div className="player-skill-groups">{abilities.map(item => <div key={item.key} className="player-skill-group">
+      <h3>{item.label}<b>{signed(mod(item.key))}</b></h3>
+      <ul className="player-skill-list">
+        {row(`save-${item.key}`, 'Спасбросок', mod(item.key) + ((game.saves || []).includes(item.key) ? pb : 0) + stats.saves, (game.saves || []).includes(item.key) ? 1 : 0)}
+        {skills.filter(skill => skill.ability === item.key).map(skill => row(skill.id, skill.label, mod(skill.ability) + pb * (profs[skill.id] || 0), profs[skill.id] || 0))}
+      </ul>
+    </div>)}</div>
+    {extra && <p className="player-profs"><span>Владения и другое</span>{extra}</p>}
+  </section>;
 }

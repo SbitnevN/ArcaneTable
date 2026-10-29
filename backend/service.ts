@@ -3,22 +3,25 @@ import { writeProjectArchive, readProjectArchive, byteLimit } from './archive.js
 import { pipeline } from 'node:stream/promises';
 import { createWriteStream, statSync as fileStat } from 'node:fs';
 import { importLss, exportLss } from './lss.js';
+import { isLssJson, parseCharacterJson } from '../src/character-import.js';
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
 import { networkInterfaces } from 'node:os';
 import { publicCombat } from './combat.js';
 import { imageSize } from 'image-size';
 import { Access, type Identity } from './access.js';
 import { characters } from '../src/contracts.js';
-import { randomBytes, randomUUID } from 'node:crypto';
-import { mkdirSync, readFileSync, writeFileSync, unlinkSync } from 'node:fs';
+import { randomBytes, randomUUID, randomInt } from 'node:crypto';
+import { mkdirSync, readFileSync, writeFileSync, unlinkSync, renameSync } from 'node:fs';
 import { createReadStream, statSync } from 'node:fs';
 import { join, resolve, extname, sep } from 'node:path';
 import { WebSocketServer, WebSocket } from 'ws';
 import { Store } from './store.js';
+import { Spotify } from './spotify.js';
+import { inventoryFrom, itemKindLabels } from '../src/library.js';
 import type { PublicView, Command } from '../src/contracts.js';
 
 const csp = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; connect-src 'self' ws:; media-src 'self' blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'";
-export async function createService(directory: string, options: { staticRoot?: string; desktop?: { state: () => { monitors: { id: number; label: string }[]; monitorId: number; fullscreen: boolean }; open: (monitorId: number, fullscreen?: boolean) => Promise<void> } } = {}) {
+export async function createService(directory: string, options: { staticRoot?: string; desktop?: { state: () => { monitors: { id: number; label: string }[]; monitorId: number; fullscreen: boolean }; open: (monitorId: number, fullscreen?: boolean) => Promise<void> }; openExternal?: (url: string) => Promise<void> } = {}) {
   const store = await Store.open(directory);
   const master = randomBytes(32).toString('hex');
   const display = randomBytes(32).toString('hex');
@@ -26,8 +29,19 @@ export async function createService(directory: string, options: { staticRoot?: s
   mkdirSync(uploads, { recursive: true });
   const sockets = new WebSocketServer({ noServer: true, maxPayload: 1024 });
   const accessStore = new Access(directory);
+  const spellTextsFile = join(directory, 'spell-texts.json');
+  const spellTexts = (): Record<string, { name?: string; text: string }> => { try { return JSON.parse(readFileSync(spellTextsFile, 'utf8')); } catch { return {}; } };
+  const spotify = new Spotify(directory, () => broadcast(), options.openExternal ? () => options.openExternal!('spotify:') : undefined);
   const roles = new Map<WebSocket, { identity: Identity; port?: number }>();
   let lan: Server | null = null; let lanAddress = ''; let lanPort = 0;
+  // The shared join QR: only its token lives in memory, so after a restart the master shows a fresh one.
+  let invite: { id: string; token: string; shown: boolean } | null = null;
+  // TV pairing: a TV opens the short address /tv and shows a 4-digit code; the master confirms it in «Подключения»
+  // and the TV receives its own screen link. Requests live 10 minutes in memory, at most 5 at once.
+  type TvPair = { id: string; secret: string; code: string; created: number; token?: string };
+  let tvPairs: TvPair[] = [];
+  const livePairs = () => (tvPairs = tvPairs.filter(pair => Date.now() - pair.created < 600000));
+  const inviteView = () => { const record = invite && accessStore.find(invite.id); return invite && record && lan ? { id: invite.id, shown: invite.shown, link: `http://${lanAddress}:${lanPort}/?invite=${invite.token}`, uses: record.uses || 0, expiresAt: record.expiresAt, projectId: record.projectId } : null; };
   const local = (request: IncomingMessage) => ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(request.socket.remoteAddress || '');
   const interfaces = () => Object.entries(networkInterfaces()).flatMap(([name, addresses]) => (addresses || []).filter(address => address.family === 'IPv4' && !address.internal && /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(address.address)).map(address => ({ name, address: address.address })));
   const validHost = (request: IncomingMessage) => {
@@ -53,22 +67,25 @@ export async function createService(directory: string, options: { staticRoot?: s
     const project = store.state().projects.find(item => item.id === grant?.projectId);
     if (!grant || !project) throw new Error('Проект игрока больше недоступен');
     const own = grant.characterId && project.games[grant.characterId] ? { characterId: grant.characterId, game: project.games[grant.characterId] } : null;
-    return { shop: store.state().liveId === project.id ? publicShop(project) : null, pendingAction: Boolean(project.combat?.pending.some(request => project.combat?.participants.find(item => item.id === request.sourceId)?.characterId === grant.characterId)), combat: publicCombat(project), projectName: project.name, playerName: grant.playerName || '', own, characters: project.characters.filter(character => project.games[character.id]).map(character => ({ ...character, occupied: accessStore.occupied(project.id, character.id, identity.id) })) };
+    return { icons: project.icons, shop: store.state().liveId === project.id ? publicShop(project, project.activeShopId, true) : null, pendingAction: Boolean(project.combat?.pending.some(request => project.combat?.participants.find(item => item.id === request.sourceId)?.characterId === grant.characterId)), combat: publicCombat(project), projectName: project.name, playerName: grant.playerName || '', own, characters: project.characters.filter(character => project.games[character.id]).map(character => ({ ...character, occupied: accessStore.occupied(project.id, character.id, identity.id) })),
+      catalog: [...(project.items || []).map(item => inventoryFrom(item, item.id, 1, itemKindLabels[item.kind])), ...(project.weapons || []).map(weapon => inventoryFrom(weapon, weapon.id, 1, 'Оружие'))], spells: project.spells || [] };
   }
   function publicMedia(view: PublicView | null, path: string) {
-    return view?.icons?.heart === path || view?.icons?.shield === path || view?.scene?.url === path || view?.character?.image === path || view?.combat?.participants.some(p => p.portrait?.image === path) || view?.shop?.artwork?.image === path || view?.shop?.items.some(i => i.artwork?.image === path);
+    return view?.icons?.heart === path || view?.icons?.shield === path || view?.scene?.url === path || view?.character?.image === path || view?.party?.some(p => p.portrait?.image === path) || view?.combat?.participants.some(p => p.portrait?.image === path) || view?.shop?.artwork?.image === path || view?.shop?.items.some(i => i.artwork?.image === path);
   }
   function mediaAllowed(identity: Identity, path: string) {
     const state = store.state();
-    if (identity.role === 'master') return state.projects.some(p => Object.values(p.icons).includes(path) || p.scenes.some(s => s.url === path) || p.tracks.some(t => t.url === path) || p.characters.some(c => c.image === path) || p.monsters.some(m => m.portrait?.image === path) || [p.combat,...p.encounters].some(c => c?.participants.some(v => v.portrait?.image === path)) || p.shops.some(s => s.artwork?.image === path || s.items.some(i => i.artwork?.image === path)));
+    if (identity.role === 'master') return state.projects.some(p => Object.values(p.icons).includes(path) || p.scenes.some(s => s.url === path) || p.tracks.some(t => t.url === path) || p.characters.some(c => c.image === path) || p.monsters.some(m => m.portrait?.image === path || m.loot?.some(i => i.artwork?.image === path)) || (p.plans || []).some(plan => plan.enemies.some(e => e.loot.some(i => i.artwork?.image === path))) || Object.values(p.games).some(g => g.items?.some(i => i.artwork?.image === path)) || [p.combat,...p.encounters].some(c => c?.participants.some(v => v.loot?.some(i => i.artwork?.image === path)) || c?.loot?.pool.some(i => i.artwork?.image === path)) || [p.combat,...p.encounters].some(c => c?.participants.some(v => v.portrait?.image === path)) || (p.items || []).some(i => i.artwork?.image === path) || p.shops.some(s => s.artwork?.image === path || s.items.some(i => i.artwork?.image === path)));
     if (identity.role === 'player') {
       const project = state.projects.find(p => p.id === accessStore.find(identity.id)?.projectId);
-      return project?.characters.some(c => c.image === path) || project?.id === state.liveId && publicMedia(store.publicView(),path);
+      const grant = accessStore.find(identity.id);
+      if (project && ((project.items || []).some(i => i.artwork?.image === path) || (grant?.characterId && project.games[grant.characterId]?.items?.some(i => i.artwork?.image === path)) || project.combat?.loot?.pool.some(i => i.artwork?.image === path))) return true;
+      return project?.characters.some(c => c.image === path) || project && (Object.values(project.icons).includes(path) || publicCombat(project)?.participants.some(p => p.portrait?.image === path)) || project?.id === state.liveId && publicMedia(store.publicView(),path);
     }
     return publicMedia(store.publicView(),path);
   }
   function networkView() {
-    return { enabled: Boolean(lan), address: lanAddress, port: lanPort, url: lan ? `http://${lanAddress}:${lanPort}` : '', interfaces: interfaces(), connections: accessStore.list().map(record => ({ ...record, online: [...roles.values()].some(client => client.identity.id === record.id) })) };
+    return { enabled: Boolean(lan), address: lanAddress, port: lanPort, url: lan ? `http://${lanAddress}:${lanPort}` : '', interfaces: interfaces(), invite: inviteView(), tvPairs: livePairs().filter(pair => !pair.token).map(({ id, code, created }) => ({ id, code, created })), connections: accessStore.list().filter(record => record.role !== 'invite').map(record => ({ ...record, online: [...roles.values()].some(client => client.identity.id === record.id) })) };
   }
   async function stopLan() {
     if (!lan) return;
@@ -81,7 +98,7 @@ export async function createService(directory: string, options: { staticRoot?: s
       if (!validHost(request) || !options.staticRoot) { response.writeHead(404); response.end(); return; }
       const base = resolve(options.staticRoot);
       const pathname = decodeURIComponent(new URL(request.url || '/', 'http://localhost').pathname);
-      const filename = resolve(base, '.' + (pathname === '/' ? '/index.html' : pathname));
+      const filename = resolve(base, '.' + (pathname === '/' || pathname === '/tv' ? '/index.html' : pathname));
       if (!filename.startsWith(base + sep)) throw new Error('Invalid path');
       const mime: Record<string, string> = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.png': 'image/png' };
       response.writeHead(200, { 'Content-Type': mime[extname(filename)] || 'application/octet-stream', 'Content-Security-Policy': csp, 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer' }); response.end(readFileSync(filename));
@@ -92,6 +109,7 @@ export async function createService(directory: string, options: { staticRoot?: s
     response.end(JSON.stringify(body));
   }
   function broadcast() {
+    spotify.sync(store.state().spotify);
     for (const [socket, client] of roles) if (socket.readyState === WebSocket.OPEN) {
       if (!validIdentity(client.identity)) { socket.close(1008, 'Access expired or revoked'); roles.delete(socket); continue; }
       try {
@@ -125,6 +143,27 @@ export async function createService(directory: string, options: { staticRoot?: s
         response.setHeader('Set-Cookie', `${name}=${token}; HttpOnly; SameSite=Strict; Path=/`);
         send(response, 200, { role: identity.role, root: Boolean(identity.root) }); return;
       }
+      if ((url.pathname === '/api/tv/pair' || url.pathname === '/api/tv/status') && request.method === 'POST') {
+        if (request.headers.origin !== origin || !request.headers['content-type']?.startsWith('application/json')) { send(response, 403, { error: 'Недопустимый запрос' }); return; }
+        const value = JSON.parse((await body(request, 1024)).toString());
+        if (url.pathname === '/api/tv/pair') {
+          const waiting = livePairs().filter(pair => !pair.token);
+          if (waiting.length >= 5) tvPairs = tvPairs.filter(pair => pair !== waiting[0]);
+          let code = ''; do code = String(randomInt(1000, 10000)); while (tvPairs.some(pair => pair.code === code));
+          const pair = { id: randomUUID(), secret: randomBytes(16).toString('hex'), code, created: Date.now() };
+          tvPairs.push(pair); broadcast(); send(response, 200, { id: pair.id, secret: pair.secret, code }); return;
+        }
+        const pair = livePairs().find(item => item.id === value.id && item.secret === value.secret);
+        if (!pair) { send(response, 404, { error: 'Код устарел или отклонён. Обновите страницу.' }); return; }
+        if (pair.token) { tvPairs = tvPairs.filter(item => item !== pair); send(response, 200, { token: pair.token }); return; }
+        send(response, 200, { waiting: true }); return;
+      }
+      if (url.pathname === '/api/invite/accept' && request.method === 'POST') {
+        if (request.headers.origin !== origin || !request.headers['content-type']?.startsWith('application/json')) { send(response, 403, { error: 'Недопустимый запрос' }); return; }
+        const value = JSON.parse((await body(request, 1024)).toString());
+        const token = accessStore.accept(String(value.token || ''));
+        broadcast(); send(response, 200, { token }); return;
+      }
       const identity = identify(request);
       if (!identity) { send(response, 401, { error: 'Требуется действующая сессия' }); return; }
       const access = identity.role;
@@ -143,18 +182,27 @@ export async function createService(directory: string, options: { staticRoot?: s
           if (typeof value.characterId !== 'string' || !project.games[value.characterId] || typeof value.name !== 'string') throw new Error('Выберите персонажа и введите имя');
           accessStore.claim(identity.id, value.characterId, value.name);
         } else if (url.pathname === '/api/player/command') {
-          if (!grant.characterId || !project.games[grant.characterId] || !['player.update', 'player.action'].includes(value.type)) throw new Error('Нет доступа к персонажу');
-          if (value.type === 'player.action') {
+          if (!grant.characterId || !project.games[grant.characterId] || !['player.update', 'player.action', 'player.loot', 'player.buy'].includes(value.type)) throw new Error('Нет доступа к персонажу');
+          if (value.type === 'player.buy') {
+            if (store.state().liveId !== project.id || !project.activeShopId || value.shopId !== project.activeShopId) throw new Error('Лавка закрыта');
+            store.execute({ id: value.id, type: 'shop.buy', projectId: project.id, shopId: value.shopId, itemId: value.itemId, characterId: grant.characterId, amount: value.amount });
+          } else if (value.type === 'player.loot') {
+            if (!['take', 'pass'].includes(value.kind)) throw new Error('Неизвестное действие с добычей');
+            store.execute({ id: value.id, type: value.kind === 'take' ? 'combat.loot.take' : 'combat.loot.pass', projectId: project.id, characterId: grant.characterId, itemId: value.itemId });
+          } else if (value.type === 'player.action') {
             store.execute({ id: value.id, type: 'combat.request', projectId: project.id, characterId: grant.characterId, targetId: value.targetId, kind: value.kind, amount: value.amount });
           } else {
           const game = { ...project.games[grant.characterId], hp: value.hp ?? project.games[grant.characterId].hp, blocks: value.blocks ?? project.games[grant.characterId].blocks };
-          if (value.sheet && typeof value.sheet === 'object') for (const key of ['level','race','className','speed','abilities','inventory','spells','spellBook'] as const) if (value.sheet[key] !== undefined) Object.assign(game, { [key]: value.sheet[key] });
+          if (value.sheet && typeof value.sheet === 'object') for (const key of ['level','race','className','speed','abilities','inventory','spells','spellBook','items','saves','skills','initiative','attacks','features','coins','spellSlots'] as const) if (value.sheet[key] !== undefined) Object.assign(game, { [key]: value.sheet[key] });
           store.execute({ id: value.id, type: 'character.update', projectId: project.id, characterId: grant.characterId, game });
           }
         } else { send(response, 404, { error: 'Действие не найдено' }); return; }
         broadcast(); send(response, 200, playerView(identity)); return;
       }
       if (url.pathname === '/api/display' && request.method === 'GET') { send(response, 200, store.publicView()); return; }
+      if (url.pathname === '/api/display-invite' && request.method === 'GET') { const view = inviteView(); send(response, 200, view?.shown ? { link: view.link } : null); return; }
+      // Spell description translations are shared reference data: every connected role may read them.
+      if (url.pathname === '/api/spell-texts' && request.method === 'GET') { send(response, 200, spellTexts()); return; }
       if (url.pathname.startsWith('/media/') && request.method === 'GET') {
         const id = url.pathname.slice(7);
         const allowed = mediaAllowed(identity,url.pathname);
@@ -181,6 +229,7 @@ export async function createService(directory: string, options: { staticRoot?: s
         send(response, 200, networkView()); return;
       }
       if (url.pathname === '/api/desktop' && request.method === 'GET') { send(response, 200, options.desktop ? { available: true, ...options.desktop.state() } : { available: false, monitors: [], monitorId: 0, fullscreen: false }); return; }
+      if (url.pathname === '/api/spotify' && request.method === 'GET') { send(response, 200, spotify.status()); return; }
       if (url.pathname === '/api/state' && request.method === 'GET') { send(response, 200, store.state()); return; }
       if (url.pathname === '/api/display-link' && request.method === 'GET') { send(response, 200, { path: `/?display=${display}` }); return; }
       if (url.pathname === '/api/project/export' && request.method === 'GET') {
@@ -219,7 +268,9 @@ export async function createService(directory: string, options: { staticRoot?: s
             if (!options.staticRoot) throw new Error('Сначала выполните сборку приложения');
             const server = createServer((req, res) => { void handle(req, res, () => staticPage(req, res)); });
             attach(server);
-            await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, value.address, () => { server.removeListener('error', reject); resolve(); }); });
+            // A fixed port keeps the short TV address the same between sessions; any free port if it is taken.
+            const listen = (port: number) => new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(port, value.address, () => { server.removeListener('error', reject); resolve(); }); });
+            await listen(4747).catch(() => listen(0));
             lan = server; lanAddress = value.address;
             const address = server.address(); lanPort = address && typeof address !== 'string' ? address.port : 0;
           }
@@ -231,10 +282,47 @@ export async function createService(directory: string, options: { staticRoot?: s
           const grant = accessStore.create(value.role, value.label, value.hours, value.projectId);
           send(response, 200, { ...networkView(), link: `http://${lanAddress}:${lanPort}/?join=${grant.token}` }); return;
         }
-        if (url.pathname === '/api/connections/revoke') accessStore.revoke(value.id);
+        if (url.pathname === '/api/connections/invite') {
+          if (!lan) throw new Error('Сначала включите локальную сеть');
+          if (!store.state().projects.some(project => project.id === value.projectId)) throw new Error('Выберите кампанию');
+          const created = accessStore.invite(value.projectId, value.hours); invite = { id: created.id, token: created.token, shown: true };
+        } else if (url.pathname === '/api/connections/invite-show') {
+          if (!invite || typeof value.shown !== 'boolean') throw new Error('Сначала создайте общий QR');
+          invite.shown = value.shown;
+        } else if (url.pathname === '/api/connections/revoke') { accessStore.revoke(value.id); if (invite?.id === value.id) invite = null; }
         else if (url.pathname === '/api/connections/release') accessStore.release(value.id);
+        else if (url.pathname === '/api/connections/tv-approve') {
+          const pair = livePairs().find(item => item.id === value.id && !item.token);
+          if (!pair) throw new Error('Телевизор уже не ждёт: обновите страницу на нём');
+          pair.token = accessStore.create('display', `Телевизор · ${pair.code}`, 24).token;
+        } else if (url.pathname === '/api/connections/tv-reject') tvPairs = tvPairs.filter(item => item.id !== value.id);
         else { send(response, 404, { error: 'Действие не найдено' }); return; }
         broadcast(); send(response, 200, networkView()); return;
+      }
+      if (url.pathname === '/api/spell-texts') {
+        const value = JSON.parse((await body(request, 20 * 1024 * 1024)).toString('utf8').replace(/^\uFEFF/, ''));
+        const incoming = value && typeof value.texts === 'object' && value.texts !== null ? value.texts : null;
+        if (!incoming) throw new Error('Нет переводов');
+        const next = value.replace ? {} as Record<string, { name?: string; text: string }> : spellTexts();
+        for (const [key, entry] of Object.entries(incoming as Record<string, { name?: unknown; text?: unknown }>)) {
+          if (!/^(2014|2024):[^\n]{1,120}$/.test(key) || !entry || typeof entry.text !== 'string' || entry.text.length > 30000 || entry.name !== undefined && (typeof entry.name !== 'string' || entry.name.length > 120)) throw new Error(`Некорректный перевод: ${key.slice(0, 60)}`);
+          if (entry.text.trim()) next[key] = { ...(entry.name ? { name: entry.name.trim() } : {}), text: entry.text.trim() }; else delete next[key];
+        }
+        if (Object.keys(next).length > 3000) throw new Error('Слишком много переводов');
+        writeFileSync(`${spellTextsFile}.tmp`, JSON.stringify(next), { flush: true }); renameSync(`${spellTextsFile}.tmp`, spellTextsFile);
+        broadcast(); send(response, 200, next); return;
+      }
+      if (url.pathname.startsWith('/api/spotify/')) {
+        if (!identity.root || !local(request)) { send(response, 403, { error: 'Spotify настраивается только на основном компьютере' }); return; }
+        const value = JSON.parse((await body(request, 4096)).toString() || '{}');
+        if (url.pathname === '/api/spotify/client') spotify.setClientId(value.clientId);
+        else if (url.pathname === '/api/spotify/logout') spotify.logout();
+        else if (url.pathname === '/api/spotify/login') {
+          const link = await spotify.authorize();
+          if (options.openExternal) await options.openExternal(link);
+          send(response, 200, { ...spotify.status(), link }); return;
+        } else { send(response, 404, { error: 'Действие не найдено' }); return; }
+        broadcast(); send(response, 200, spotify.status()); return;
       }
       if (url.pathname === '/api/command') {
         if (!request.headers['content-type']?.startsWith('application/json')) throw new Error('Ожидается JSON');
@@ -251,10 +339,17 @@ export async function createService(directory: string, options: { staticRoot?: s
         } finally { try { unlinkSync(filename); } catch {} }
         return;
       }
-      if (url.pathname === '/api/lss/import') {
+      if (url.pathname === '/api/lss/import' || url.pathname === '/api/character/import') {
+        // One entry point for both formats: Long Story Short files and our own \u00ABarcane-character\u00BB JSON (often written by an AI).
         const projectId = url.searchParams.get('projectId') || '';
-        const imported = importLss(JSON.parse((await body(request, 5 * 1024 * 1024)).toString('utf8').replace(/^\uFEFF/, '')));
-        const state = store.execute({ id: randomUUID(), type: 'character.import', projectId }, undefined, undefined, undefined, imported);
+        const project = store.state().projects.find(item => item.id === projectId);
+        let input: unknown;
+        try { input = JSON.parse((await body(request, 5 * 1024 * 1024)).toString('utf8').replace(/^\uFEFF/, '').replace(/^\s*```(?:json)?|```\s*$/g, '')); } catch { throw new Error('\u042D\u0442\u043E \u043D\u0435 JSON. \u041F\u0440\u043E\u0432\u0435\u0440\u044C\u0442\u0435, \u0447\u0442\u043E \u043E\u0442\u0432\u0435\u0442 \u043D\u0435\u0439\u0440\u043E\u0441\u0435\u0442\u0438 \u0441\u043A\u043E\u043F\u0438\u0440\u043E\u0432\u0430\u043D \u0446\u0435\u043B\u0438\u043A\u043E\u043C'); }
+        const imported = isLssJson(input) ? { ...importLss(input), items: [], weapons: [], spells: [] } : parseCharacterJson(input, { edition: project?.edition, library: { items: project?.items || [], weapons: project?.weapons || [] } });
+        const projectEdition = project?.edition;
+        if (projectEdition && imported.game.edition !== projectEdition) imported.warnings.push(`\u041F\u0435\u0440\u0441\u043E\u043D\u0430\u0436 \u0432 \u0440\u0435\u0434\u0430\u043A\u0446\u0438\u0438 D&D ${imported.game.edition}, \u0430 \u043F\u0440\u043E\u0435\u043A\u0442 \u2014 D&D ${projectEdition}. \u041B\u0438\u0441\u0442 \u0441\u043E\u0445\u0440\u0430\u043D\u0451\u043D \u043A\u0430\u043A \u0435\u0441\u0442\u044C; \u0441\u043C\u0435\u043D\u0430 \u0440\u0435\u0434\u0430\u043A\u0446\u0438\u0438 \u0432 \u043D\u0430\u0441\u0442\u0440\u043E\u0439\u043A\u0430\u0445 \u043F\u0440\u043E\u0435\u043A\u0442\u0430 \u043F\u0435\u0440\u0435\u0432\u0435\u0434\u0451\u0442 \u0438 \u0435\u0433\u043E.`);
+        const replace = url.searchParams.get('replace') || undefined;
+        const state = store.execute({ id: randomUUID(), type: 'character.import', projectId, ...(replace ? { characterId: replace } : {}) }, undefined, undefined, undefined, imported);
         broadcast(); send(response, 200, { state, warnings: imported.warnings }); return;
       }
       if (url.pathname === '/api/icon') {
@@ -264,6 +359,15 @@ export async function createService(directory: string, options: { staticRoot?: s
         if (!extension || !size.width || !size.height || size.width > 2048 || size.height > 2048) throw new Error('Нужен PNG/WebP не более 2048 × 2048');
         const filename = `${randomUUID()}.${extension}`; writeFileSync(join(uploads,filename),bytes,{ flag:'wx',flush:true });
         try { const state = store.execute({ id:randomUUID(),type:'icon.import',projectId,kind },undefined,undefined,{ image:`/media/${filename}`,width:size.width,height:size.height }); broadcast(); send(response,200,state); }
+        catch (error) { unlinkSync(join(uploads,filename)); throw error; } return;
+      }
+      if (url.pathname === '/api/item-artwork') {
+        const projectId = url.searchParams.get('projectId') || ''; const itemId = url.searchParams.get('itemId') || '';
+        if (!store.state().projects.find(p => p.id === projectId)?.items?.some(i => i.id === itemId)) throw new Error('Предмет не найден');
+        const bytes = await body(request,25*1024*1024); const size = imageSize(bytes); const extension = size.type === 'png' ? 'png' : size.type === 'jpg' ? 'jpg' : size.type === 'webp' ? 'webp' : null;
+        if (!extension || !size.width || !size.height || size.width*size.height > 64000000) throw new Error('Нужен PNG/JPEG/WebP не более 64 мегапикселей');
+        const filename = `${randomUUID()}.${extension}`; writeFileSync(join(uploads,filename),bytes,{ flag:'wx',flush:true });
+        try { const state = store.execute({ id:randomUUID(),type:'item.artwork',projectId,itemId },undefined,undefined,{ image:`/media/${filename}`,width:size.width,height:size.height }); broadcast(); send(response,200,state); }
         catch (error) { unlinkSync(join(uploads,filename)); throw error; } return;
       }
       if (url.pathname === '/api/shop-artwork') {
@@ -317,7 +421,8 @@ export async function createService(directory: string, options: { staticRoot?: s
         const name = (url.searchParams.get('name') || 'Новая сцена').slice(0, 100);
         writeFileSync(join(uploads, filename), bytes, { flag: 'wx', flush: true });
         try {
-          const state = store.execute({ id: randomUUID(), type: 'scene.import', projectId }, { id, name, url: `/media/${filename}`, type: extension === 'mp4' || extension === 'webm' ? 'video' : 'image', folderId: url.searchParams.get('folderId') || null });
+          const sceneId = url.searchParams.get('sceneId') || undefined;
+          const state = store.execute({ id: randomUUID(), type: sceneId ? 'scene.replace' : 'scene.import', projectId, sceneId }, { id, name, url: `/media/${filename}`, type: extension === 'mp4' || extension === 'webm' ? 'video' : 'image', folderId: url.searchParams.get('folderId') || null });
           broadcast(); send(response, 200, state);
         } catch (error) { unlinkSync(join(uploads, filename)); throw error; }
         return;
@@ -343,5 +448,5 @@ export async function createService(directory: string, options: { staticRoot?: s
       });
     });
   }
-  return { handle, attach, csp, master, display, store, access: accessStore, close() { clearInterval(expiryTimer); if (lan) { lan.closeAllConnections(); lan.close(); } for (const ws of roles.keys()) ws.terminate(); sockets.close(); store.close(); } };
+  return { handle, attach, csp, master, display, store, access: accessStore, close() { clearInterval(expiryTimer); if (lan) { lan.closeAllConnections(); lan.close(); } for (const ws of roles.keys()) ws.terminate(); sockets.close(); store.close(); spotify.close(); } };
 }

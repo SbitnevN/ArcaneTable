@@ -1,17 +1,24 @@
-﻿import { ShopEditor, ShopStage } from './shop';
+﻿import QRCode from 'qrcode';
+import { ShopEditor, ShopStage } from './shop';
 import { publicShop } from './shop-view';
-import { SceneTools, MasterNotes, DisplayCue, Soundboard, SoundEngine } from './project-tools';
-import { ReferenceLibrary } from './references';
+import { SceneTools, MasterNotes, DisplayCue, CueButton, HeroesOnTable, Soundboard, SoundEngine } from './project-tools';
+import { Bestiary } from './bestiary';
+import { Spellbook } from './grimoire';
+import { ItemsPage } from './items';
+import { registerSpellApi } from './spell-ru';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { newId, characters, defaultGames, validGame, type Command, type Game, type PublicView, type Workspace, type Character, type Icons } from './contracts';
+import { newId, characters, defaultGames, validGame, type Command, type Game, type PublicView, type Workspace, type Character, type Spell, type Weapon, type Item } from './contracts';
 
 import { StageCanvas } from './stage';
+import { applyTheme, storedTheme, themes, type ThemeId } from './themes';
 import { Locations } from './locations';
-import { MusicEngine, MusicEditor } from './music';
+import { ProjectsPage } from './projects';
+import { MusicEngine } from './music';
+import { MusicEditor } from './music-editor';
 import { CharacterLibrary } from './character-library';
 import { Connections } from './connections';
-import { CombatEditor, CombatStage } from './combat';
-import { publicCombat } from './combat-view';
+import { CardScale, CombatEditor, CombatStage } from './combat';
+import { publicCombat, publicParty } from './combat-view';
 import { Player } from './player';
 
 declare global {
@@ -31,6 +38,7 @@ async function api<T>(path: string, options?: RequestInit): Promise<T> {
   if (!response.ok) throw new ApiError(data.error || 'Не удалось выполнить запрос', response.status);
   return data;
 }
+registerSpellApi(api);
 function useRealtime(ready: boolean, onMessage: () => void) {
   const callback = useRef(onMessage); callback.current = onMessage;
   useEffect(() => {
@@ -48,22 +56,30 @@ function useRealtime(ready: boolean, onMessage: () => void) {
     return () => { disposed = true; clearTimeout(timer); socket?.close(); };
   }, [ready]);
 }
+// Shared join QR in the corner of the table screen, shown while the master keeps it on.
+function JoinQr({ link }: { link: string }) {
+  const [image, setImage] = useState('');
+  useEffect(() => { let alive = true; void QRCode.toDataURL(link, { width: 320, margin: 1, errorCorrectionLevel: 'M', color: { dark: '#1b140c', light: '#f6ecd4' } }).then(value => { if (alive) setImage(value); }).catch(() => {}); return () => { alive = false; }; }, [link]);
+  return image ? <aside className="display-join" aria-label="QR-код для подключения игроков"><img src={image} alt=""/><div><strong>Присоединяйтесь</strong><span>Наведите камеру телефона</span><small>{link.replace(/\?invite=.*/, '')}</small></div></aside> : null;
+}
 function Display() {
   const [view, setView] = useState<PublicView | null>(null);
+  const [join, setJoin] = useState<string | null>(null);
   const [error, setError] = useState('');
   const refresh = useCallback(() => {
     void api<PublicView | null>('/api/display').then(value => { setView(value); setError(''); }).catch(err => setError(err.message));
+    void api<{ link: string } | null>('/api/display-invite').then(value => setJoin(value?.link || null)).catch(() => setJoin(null));
   }, []);
   useEffect(refresh, [refresh]);
   useRealtime(true, refresh);
   const character = view?.character || characters.find(item => item.id === view?.characterId);
   return <div className="presentation">
     {view && (character || view.combat?.running || view.shop) ? <><div className="live-project">{view.projectName}</div>{view.shop ? <ShopStage shop={view.shop} view={view}/> : view.combat?.running ? <CombatStage view={view}/> : <StageCanvas view={view}/>}</> : <div className="waiting"><span>✦</span><h1>Arcane Table</h1><p>Мастер готовит следующую сцену</p></div>}
-    <DisplayCue cue={view?.cue}/><button className="display-fullscreen" onClick={() => void (document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen()).catch(() => setError('Полный экран недоступен в этом браузере'))}>⛶</button>
+    <DisplayCue cue={view?.cue}/>{join && <JoinQr link={join}/>}<button className="display-fullscreen" onClick={() => void (document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen()).catch(() => setError('Полный экран недоступен в этом браузере'))}>⛶</button>
     {error && <div className="connection-error">{error}</div>}
   </div>;
 }
-export function WorkspaceShell({ children }: { children: (props: { icons:Icons; onSettings:() => void; characterId: string; character: Character; roster: Character[]; game: Game; onGame: React.Dispatch<React.SetStateAction<Game>>; onSelect: (id: string) => void; section: 'character' | 'notes' }) => React.ReactNode }) {
+export function WorkspaceShell({ children }: { children: (props: { characterId: string; character: Character; roster: Character[]; game: Game; onGame: React.Dispatch<React.SetStateAction<Game>>; onSelect: (id: string) => void; section: 'character' | 'notes'; weapons: Weapon[]; spells: Spell[]; items: Item[] }) => React.ReactNode }) {
   const [state, setState] = useState<Workspace | null>(null);
   const [role, setRole] = useState<'master' | 'display' | 'player' | null>(null);
   const [error, setError] = useState('');
@@ -71,10 +87,12 @@ export function WorkspaceShell({ children }: { children: (props: { icons:Icons; 
   const [isRoot, setIsRoot] = useState(false);
   const [status, setStatus] = useState('Подключение…');
   const [page, setPage] = useState('preview');
+  const [mobileMenu, setMobileMenu] = useState(false);
+  useEffect(() => { document.getElementById('editor-panel')?.scrollTo(0, 0); setMobileMenu(false); }, [page]);
   const [uiScale, setUiScale] = useState(() => { try { const value = Number(localStorage.getItem('arcane-ui-scale') || 100); return [80,90,100,110,125,150].includes(value) ? value : 100; } catch { return 100; } });
   useEffect(() => { try { localStorage.setItem('arcane-ui-scale', String(uiScale)); } catch { /* UI preference storage is optional. */ } }, [uiScale]);
-  const [name, setName] = useState('');
-  const [rename, setRename] = useState('');
+  const [theme, setTheme] = useState<ThemeId>(storedTheme);
+  useEffect(() => applyTheme(theme), [theme]);
   const [monitors, setMonitors] = useState<{ id: number; label: string }[]>([]);
   const [monitor, setMonitor] = useState(0);
   const [fullscreen, setFullscreen] = useState(false);
@@ -99,9 +117,12 @@ export function WorkspaceShell({ children }: { children: (props: { icons:Icons; 
     initialized.current = true;
     const params = new URLSearchParams(location.search);
     if (params.has('master')) { displayToken = null; sessionStorage.removeItem('arcane-access-token'); sessionStorage.removeItem('arcane-display-token'); }
+    else if (params.has('invite')) displayToken = null;
     else displayToken = params.get('join') || params.get('display') || sessionStorage.getItem('arcane-access-token') || sessionStorage.getItem('arcane-display-token');
-    const token = displayToken || params.get('master');
-    const connect = token ? api<{ role: 'master' | 'display' | 'player'; root: boolean }>(`/api/session?token=${encodeURIComponent(token)}`) : api<{ role: 'master' | 'display' | 'player'; root: boolean }>('/api/me');
+    // A phone that scanned the shared QR first swaps the invite for its own player link.
+    const invite = params.get('invite');
+    const accepted = invite ? api<{ token: string }>('/api/invite/accept', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: invite }) }).then(value => { displayToken = value.token; return value.token; }) : Promise.resolve(null);
+    const connect = accepted.then(() => { const token = displayToken || params.get('master'); return token ? api<{ role: 'master' | 'display' | 'player'; root: boolean }>(`/api/session?token=${encodeURIComponent(token)}`) : api<{ role: 'master' | 'display' | 'player'; root: boolean }>('/api/me'); });
     void connect.then(async access => {
       history.replaceState(null, '', '/');
       if (displayToken) sessionStorage.setItem('arcane-access-token', displayToken);
@@ -219,8 +240,9 @@ export function WorkspaceShell({ children }: { children: (props: { icons:Icons; 
     send({ type: 'character.update', projectId: project.id, characterId: activeCharacter, game }, source => ({ ...source,
       projects: source.projects.map(p => p.id === project.id ? { ...p, games: { ...p.games, [activeCharacter]: game } } : p) }));
   }
-  async function importFiles(files: File[], folderId: string | null) {
-    if (pendingRef.current || importing || failed.current.length) return;
+  async function importFiles(files: File[], folderId: string | null, sceneId?: string): Promise<string | null> {
+    if (pendingRef.current || importing || failed.current.length) return null;
+    let created: string | null = null;
     const projectId = project.id;
     setImporting(true); setError('');
     const errors: string[] = [];
@@ -239,11 +261,13 @@ export function WorkspaceShell({ children }: { children: (props: { icons:Icons; 
           });
           else { const image = new Image(); image.src = url; await image.decode(); }
         } finally { URL.revokeObjectURL(url); }
-        const value = await api<Workspace>(`/api/import?projectId=${projectId}&folderId=${folderId || ''}&name=${encodeURIComponent(file.name)}`, { method: 'POST', headers: { 'Content-Type': file.type }, body: file });
+        const value = await api<Workspace>(`/api/import?projectId=${projectId}&folderId=${folderId || ''}&name=${encodeURIComponent(file.name.replace(/.[^.]+$/, ''))}${sceneId ? `&sceneId=${sceneId}` : ''}`, { method: 'POST', headers: { 'Content-Type': file.type }, body: file });
+        created = sceneId || value.projects.find(p => p.id === projectId)?.sceneId || null;
         if (current.current?.activeId === projectId) { current.current = value; setState(value); }
       } catch (err) { errors.push(`${file.name}: ${err instanceof Error ? err.message : 'Ошибка импорта'}`); }
     }
     setImporting(false); setStatus(errors.length ? 'Импорт завершён с ошибками' : 'Сохранено в SQLite'); setError(errors.join('; ')); refresh();
+    return errors.length ? null : created;
   }
   async function importAudio(files: File[]) {
     if (pendingRef.current || importing || failed.current.length) return;
@@ -280,14 +304,6 @@ export function WorkspaceShell({ children }: { children: (props: { icons:Icons; 
     } catch (err) { setError(err instanceof Error ? err.message : 'Ошибка загрузки карты'); }
     finally { setImporting(false); }
   }
-  async function importIcon(kind: string, file: File) {
-    if (busyRefPortrait()) return; setImporting(true); setError('');
-    try {
-      if (file.size > 2*1024*1024) throw new Error('Значок должен быть не больше 2 МБ');
-      const value = await api<Workspace>(`/api/icon?projectId=${project.id}&kind=${kind}`, { method:'POST',headers:{ 'Content-Type':file.type },body:file });
-      current.current = value; setState(value); setStatus('Значки сохранены в проекте');
-    } catch (err) { setError(err instanceof Error ? err.message : 'Ошибка загрузки значка'); } finally { setImporting(false); }
-  }
   async function importShopArtwork(shopId: string, itemId: string | undefined, file: File) {
     if (busyRefPortrait()) return; setImporting(true); setError('');
     try {
@@ -296,7 +312,18 @@ export function WorkspaceShell({ children }: { children: (props: { icons:Icons; 
       current.current = value; setState(value); setStatus('Изображение магазина сохранено');
     } catch (err) { setError(err instanceof Error ? err.message : 'Ошибка загрузки'); } finally { setImporting(false); }
   }
+  async function importItemArtwork(itemId: string, file: File) {
+    for (let attempt = 0; attempt < 100 && pendingRef.current > 0; attempt++) await new Promise(resolve => setTimeout(resolve, 50));
+    if (busyRefPortrait()) return; setImporting(true); setError('');
+    try {
+      if (file.size > 25 * 1024 * 1024) throw new Error('Изображение должно быть не больше 25 МБ');
+      const value = await api<Workspace>(`/api/item-artwork?projectId=${project.id}&itemId=${itemId}`, { method: 'POST', headers: { 'Content-Type': file.type }, body: file });
+      current.current = value; setState(value); setStatus('Картинка предмета сохранена');
+    } catch (err) { setError(err instanceof Error ? err.message : 'Ошибка загрузки'); } finally { setImporting(false); }
+  }
   async function importMonsterPortrait(monsterId: string, file: File) {
+    // The editor uploads the card right after saving: wait for that save to reach the server first.
+    for (let attempt = 0; attempt < 100 && pendingRef.current > 0; attempt++) await new Promise(resolve => setTimeout(resolve, 50));
     if (busyRefPortrait()) return; setImporting(true); setError('');
     try {
       if (file.size > 25 * 1024 * 1024) throw new Error('Карта должна быть не больше 25 МБ');
@@ -304,15 +331,16 @@ export function WorkspaceShell({ children }: { children: (props: { icons:Icons; 
       current.current = value; setState(value); setStatus('Карта монстра сохранена');
     } catch (err) { setError(err instanceof Error ? err.message : 'Ошибка загрузки'); } finally { setImporting(false); }
   }
-  async function importCharacter(file: File) {
-    if (busyRefPortrait()) return;
+  async function importCharacter(body: Blob | string) {
+    if (busyRefPortrait()) return false;
     setImporting(true); setError('');
     try {
-      if (file.size > 5 * 1024 * 1024) throw new Error('JSON должен быть не больше 5 МБ');
-      const result = await api<{ state: Workspace; warnings: string[] }>(`/api/lss/import?projectId=${project.id}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: file });
+      if ((typeof body === 'string' ? new Blob([body]).size : body.size) > 5 * 1024 * 1024) throw new Error('JSON должен быть не больше 5 МБ');
+      const result = await api<{ state: Workspace; warnings: string[] }>(`/api/character/import?projectId=${project.id}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
       current.current = result.state; setState(result.state); setStatus('Персонаж импортирован');
       if (result.warnings.length) setError(result.warnings.join(' '));
-    } catch (err) { setError(err instanceof Error ? err.message : 'Ошибка импорта персонажа'); }
+      return true;
+    } catch (err) { setError(err instanceof Error ? err.message : 'Ошибка импорта персонажа'); return false; }
     finally { setImporting(false); }
   }
   async function exportCharacter() {
@@ -351,8 +379,9 @@ export function WorkspaceShell({ children }: { children: (props: { icons:Icons; 
     { id: 'projects', title: 'Проекты', icon: '▦', description: 'Кампании и ваншоты' },
     { id: 'locations', title: 'Локации', icon: '▧', description: 'Папки, фото и видео' },
     { id: 'combat', title: 'Бой', icon: '⚔', description: 'Ходы и действия' },
-    { id: 'bestiary', title: 'Бестиарий', icon: '♜', description: 'SRD и мои монстры' },
-    { id: 'spells', title: 'Заклинания', icon: '✧', description: 'Справочник SRD' },
+    { id: 'bestiary', title: 'Бестиарий', icon: '♜', description: 'Классический и мастерский' },
+    { id: 'spells', title: 'Заклинания', icon: '✧', description: 'SRD и мои заклинания' },
+    { id: 'items', title: 'Предметы', icon: '⚒', description: 'Оружие, доспехи, зелья…' },
     { id: 'music', title: 'Музыка', icon: '♫', description: 'Треки и атмосфера' },
     { id: 'character', title: 'Персонажи', icon: '♙', description: 'Показатели и облик' },
     { id: 'notes', title: 'Заметки', icon: '≡', description: 'Тексты и способности' },
@@ -365,29 +394,30 @@ export function WorkspaceShell({ children }: { children: (props: { icons:Icons; 
     <header className="studio-header"><div className="studio-brand">✦ <span>ARCANE TABLE<small>МАСТЕРСКАЯ ВАШИХ ИСТОРИЙ</small></span></div><button className="project-context" onClick={() => setPage('projects')}><span>Текущий проект</span><strong>{project.name}</strong><span>Сменить ›</span></button><div className="studio-status"><span className={live ? 'live-pill' : 'idle-pill'}>{live ? `В эфире: ${live.name}` : 'Эфир не запущен'}</span><small role="status">{status === 'Сохранено в SQLite' ? 'Все изменения сохранены' : status}</small></div></header>
     <div className="studio-body"><main className="studio-content" id="editor-panel" role="tabpanel" aria-labelledby={`nav-${page}`}>
       <SoundEngine enabled={isRoot} workspace={state} send={send}/><MusicEngine enabled={isRoot} workspace={state} send={send} onStatus={setAudioError}/>
-      <div className="page-heading"><div><span className="page-kicker">{project.name}</span><h1>{currentPage.title}</h1></div>{page === 'preview' && <div className="action-row"><button className="primary" disabled={busy} onClick={() => command('project.live')}>{state.liveId === project.id ? 'Обновить эфир' : 'Вывести в эфир'}</button><button onClick={() => void openDisplay()}>Открыть общий экран ↗</button></div>}</div>
+      <div className="page-heading"><div><span className="page-kicker">{project.name}</span><h1>{currentPage.title}</h1></div>{(page === 'preview' || page === 'combat') && <div className="action-row"><button className="primary" disabled={busy} onClick={() => command('project.live')}>{state.liveId === project.id ? 'Обновить эфир' : 'Вывести в эфир'}</button><CueButton project={project} command={command} busy={busy}/><button onClick={() => void openDisplay()}>Открыть общий экран ↗</button></div>}</div>
       {error && <div className="error-banner" role="alert">{error}{failed.current.length ? <button disabled={pending > 0} onClick={() => void retrySave()}>Повторить сохранение</button> : <button onClick={() => { setError(''); refresh(); }}>Закрыть сообщение</button>}</div>}
       {page === 'preview' && <>
-        <div className="preview-context"><label>Сцена<select value={project.sceneId || ''} onChange={e => command('scene.select', { sceneId: e.target.value })}><option value="" disabled>Выберите сцену в локациях</option>{project.scenes.map(scene => <option key={scene.id} value={scene.id}>{scene.name}</option>)}</select></label><label>Персонаж<select value={activeCharacter} onChange={e => command('character.select', { characterId: e.target.value })}>{project.characters.map(character => <option key={character.id} value={character.id}>{character.name}</option>)}</select></label><p>{state.liveId === project.id ? 'Изменения этого проекта видны на общем экране.' : 'Вы готовите проект. Нажмите «Вывести в эфир», когда будете готовы.'}</p></div>
-        {project.activeShopId && publicShop(project) ? <><div className="shop-preview"><ShopStage shop={publicShop(project)!} view={{ scene: project.scenes.find(s => s.id === project.sceneId) || null, background: project.background }}/></div><p>Подготовлен магазин. «Вывести в эфир» вернёт сцену; управление магазином — в разделе «Магазины».</p></> : project.combat?.running ? <div className="combat-preview"><CombatStage view={{ icons: project.icons, character: project.characters.find(c => c.id === activeCharacter), combat: publicCombat(project), projectName: project.name, scene: project.scenes.find(scene => scene.id === project.sceneId) || null, characterId: activeCharacter, hp: project.games[activeCharacter].hp, maxHp: project.games[activeCharacter].maxHp, ac: project.games[activeCharacter].ac, layout: project.layout, background: project.background }}/></div> : <StageCanvas key={`stage-${project.id}`} edit view={{ icons: project.icons, character: project.characters.find(c => c.id === activeCharacter), projectName: project.name, scene: project.scenes.find(scene => scene.id === project.sceneId) || null, characterId: activeCharacter, hp: project.games[activeCharacter].hp, maxHp: project.games[activeCharacter].maxHp, ac: project.games[activeCharacter].ac, layout: project.layout, background: project.background }} onLayout={(layout, target) => send({ type: 'layout.update', projectId: project.id, layout, target }, source => ({ ...source, projects: source.projects.map(p => p.id === project.id ? { ...p, [target === 'card' ? 'layout' : 'background']: layout } : p) }))}/>}
+        <HeroesOnTable project={project} command={command} busy={busy}/>
+        <div className="preview-context"><label>Фон стола<select aria-label="Фон стола" value={project.sceneId || ''} onChange={e => command('scene.select', { sceneId: e.target.value })}><option value="" disabled>Выберите сцену в локациях</option>{project.scenes.map(scene => <option key={scene.id} value={scene.id}>{scene.name}</option>)}</select></label>{project.combat?.running && <CardScale project={project} command={command} busy={busy}/>}<p>{state.liveId === project.id ? 'Изменения видны на общем экране.' : 'Проект не в эфире. Нажмите «Вывести в эфир», когда будете готовы.'}</p></div>
+        {project.activeShopId && publicShop(project) ? <><div className="shop-preview"><ShopStage shop={publicShop(project)!} view={{ scene: project.scenes.find(s => s.id === project.sceneId) || null, background: project.background }}/></div><p>Подготовлен магазин. «Вывести в эфир» вернёт сцену; управление магазином — в разделе «Магазины».</p></> : project.combat?.running ? <div className="combat-preview"><CombatStage view={{ icons: project.icons, character: project.characters.find(c => c.id === activeCharacter), combat: publicCombat(project), projectName: project.name, scene: project.scenes.find(scene => scene.id === project.sceneId) || null, characterId: activeCharacter, hp: project.games[activeCharacter].hp, maxHp: project.games[activeCharacter].maxHp, ac: project.games[activeCharacter].ac, layout: project.layout, background: project.background }}/></div> : <StageCanvas key={`stage-${project.id}`} edit view={{ party: publicParty(project), icons: project.icons, character: project.characters.find(c => c.id === activeCharacter), projectName: project.name, scene: project.scenes.find(scene => scene.id === project.sceneId) || null, characterId: activeCharacter, hp: project.games[activeCharacter].hp, maxHp: project.games[activeCharacter].maxHp, ac: project.games[activeCharacter].ac, layout: project.layout, background: project.background }} onLayout={(layout, target) => send({ type: 'layout.update', projectId: project.id, layout, target }, source => ({ ...source, projects: source.projects.map(p => p.id === project.id ? { ...p, [target === 'card' ? 'layout' : 'background']: layout } : p) }))}/>}
 
-        <SceneTools project={project} command={command} busy={busy}/><p className="editor-help">Перетащите карту в кадре или настройте её справа. Размер интерфейса меняется в нижней части меню.</p>
+        <button className="table-background-button" onClick={() => setPage('locations')}>Загрузить фон стола ↗</button><SceneTools project={project} command={command} busy={busy}/>
       </>}
-      {page === 'projects' && <div className="projects-layout"><section className="editor-card"><div className="section-heading"><h2>Открытые проекты</h2><span>Перетащите, чтобы изменить порядок</span></div><div className="project-list">{state.openIds.map((id, index) => {
-        const item = state.projects.find(p => p.id === id)!;
-        return <div className={id === project.id ? 'project-row selected' : 'project-row'} key={id} draggable={!busy} onDragStart={e => { e.dataTransfer.setData('application/arcane-project', id); e.dataTransfer.effectAllowed = 'move'; }} onDragOver={e => { if (e.dataTransfer.types.includes('application/arcane-project')) e.preventDefault(); }} onDrop={e => { e.preventDefault(); const source = e.dataTransfer.getData('application/arcane-project'); if (source && source !== id && !busy) command('project.move', { projectId: source, targetIndex: index }); }}><span className="drag-grip">⠿</span><button className="project-select" aria-pressed={id === project.id} onClick={() => { setRename(''); command('project.activate', { projectId: id }); }}><strong>{item.name}</strong><small>{id === project.id ? 'Редактируется' : 'Открыть для редактирования'}{id === state.liveId ? ' · В эфире' : ''}</small></button><button disabled={busy || index === 0} aria-label={`Переместить ${item.name} выше`} onClick={() => command('project.move', { projectId: id, targetIndex: index - 1 })}>↑</button><button disabled={busy || state.openIds.length === 1} aria-label={`Закрыть вкладку ${item.name}`} onClick={() => command('project.close', { projectId: id })}>×</button></div>;
-      })}</div>{state.projects.some(p => !state.openIds.includes(p.id)) && <><h2>Сохранённые проекты</h2>{state.projects.filter(p => !state.openIds.includes(p.id)).map(item => <button className="saved-project" key={item.id} onClick={() => command('project.activate', { projectId: item.id })}>{item.name}<span>Открыть →</span></button>)}</>}</section><div className="project-forms"><section className="editor-card"><h2>Создать проект</h2><p>Новая кампания или отдельный ваншот.</p><form onSubmit={e => { e.preventDefault(); if (name.trim()) { command('project.create', { name }); setName(''); } }}><label>Название<input aria-label="Название нового проекта" placeholder="Например, Зимняя тюрьма" required maxLength={100} value={name} onChange={e => setName(e.target.value)}/></label><button className="primary" disabled={busy || !name.trim()}>Создать проект</button></form></section><section className="editor-card"><h2>Редактировать проект</h2><p>{project.name}</p><form onSubmit={e => { e.preventDefault(); if (rename.trim()) { command('project.rename', { name: rename }); setRename(''); } }}><label>Новое название<input aria-label="Новое название проекта" placeholder={project.name} required maxLength={100} value={rename} onChange={e => setRename(e.target.value)}/></label><button disabled={busy || !rename.trim()}>Сохранить название</button></form><button disabled={busy} onClick={() => command('project.duplicate')}>Создать копию проекта</button></section></div></div>}
-      {page === 'projects' && <section className="editor-card project-transfer"><h2>Резервная копия и перенос</h2><p>Архив содержит текущий проект, карты, сцены, видео и локальную музыку. Восстановление создаёт отдельный проект; запущенный эфир остаётся прежним.</p><div className="action-row"><button disabled={busy} onClick={() => void exportProject()}>Скачать архив проекта</button><label className="upload-label">Восстановить из ZIP<input disabled={busy} type="file" accept=".zip,application/zip" onChange={e => { const file = e.target.files?.[0]; e.target.value = ''; if (file) void importProject(file); }}/></label></div><p className="editor-help">Архив до 1 ГБ. Ссылки подключения не переносятся. Восстановленный бой открывается на паузе.</p></section>}
+      {page === 'projects' && <ProjectsPage state={state} project={project} command={command} busy={busy} exportProject={exportProject} importProject={importProject}/>}
       {page === 'shops' && <ShopEditor key={project.id} project={project} liveId={state.liveId} command={command} busy={busy} upload={importShopArtwork}/>}
-      {page === 'locations' && <Locations key={`locations-${project.id}`} project={project} command={command} upload={importFiles} busy={busy}/>}
+      {page === 'locations' && <Locations key={`locations-${project.id}`} project={project} command={command} upload={importFiles} uploadAudio={importAudio} busy={busy}/>}
       {page === 'character' && <CharacterLibrary key={`library-${project.id}-${activeCharacter}`} project={project} command={command} busy={busy} portrait={importPortrait} importCharacter={importCharacter} exportCharacter={exportCharacter}/>}
       {page === 'notes' && <MasterNotes project={project} command={command} busy={busy}/>}
-      {(page === 'character' || page === 'notes') && children({ icons: project.icons, onSettings: () => setPage('settings'), characterId: activeCharacter, character: project.characters.find(c => c.id === activeCharacter)!, roster: project.characters, game: project.games[activeCharacter], onGame: updateGame, onSelect: characterId => command('character.select', { characterId }), section: page })}
-      {page === 'combat' && <CombatEditor key={project.id} project={project} command={command} busy={busy}/>}
-      {(page === 'bestiary' || page === 'spells') && <ReferenceLibrary key={`${project.id}-${page}`} kind={page === 'spells' ? 'spells' : 'monsters'} project={project} command={command} busy={busy} portrait={importMonsterPortrait}/>}
+      {(page === 'character' || page === 'notes') && children({ characterId: activeCharacter, character: project.characters.find(c => c.id === activeCharacter)!, roster: project.characters, game: project.games[activeCharacter], onGame: updateGame, onSelect: characterId => command('character.select', { characterId }), section: page, weapons: project.weapons || [], spells: project.spells || [], items: project.items || [] })}
+      {page === 'combat' && <CombatEditor key={project.id} project={project} liveId={state.liveId} command={command} busy={busy} onBackground={() => setPage('locations')}/>}
+      {page === 'bestiary' && <Bestiary key={`${project.id}-bestiary`} project={project} command={command} busy={busy} portrait={importMonsterPortrait}/>}
+      {page === 'spells' && <Spellbook key={`${project.id}-spells`} project={project} command={command} busy={busy}/>}
+      {page === 'items' && <ItemsPage key={`${project.id}-items`} project={project} command={command} busy={busy} upload={importItemArtwork}/>}
       {page === 'connections' && isRoot && <Connections workspace={state} api={api}/>}
-      {page === 'music' && <><Soundboard project={project} command={command} busy={busy}/><MusicEditor key={project.id} project={project} music={state.music} command={command} upload={importAudio} busy={busy} error={audioError}/></>}
-      {page === 'settings' && <div className="settings-grid"><section className="editor-card icon-editor"><h2>Сердце и щит</h2><p>Значки сохраняются в проекте, переносятся в архиве и видны на всех карточках. PNG или WebP до 2 МБ, не более 2048 × 2048.</p>{(['heart','shield'] as const).map(kind => <div key={kind}><img src={project.icons[kind]} alt={kind === 'heart' ? 'Сердце' : 'Щит'}/><label className="upload-label">{kind === 'heart' ? 'Заменить сердце' : 'Заменить щит'}<input type="file" disabled={busy} accept="image/png,image/webp" onChange={e => { const file = e.target.files?.[0]; e.target.value = ''; if (file) void importIcon(kind,file); }}/></label><button disabled={busy} onClick={() => command('icon.reset',{ kind })}>Вернуть стандартный</button></div>)}</section><section className="editor-card"><h2>Горячие клавиши</h2><p>Ctrl + Shift + P — предпросмотр.<br/>Ctrl + Shift + L — вывести текущий проект в эфир.<br/>Ctrl + Shift + → — следующий ход.<br/>Ctrl + Shift + Z — отменить последнее изменение ХП.</p><p>Не срабатывают при наборе текста.</p></section><section className="editor-card"><h2>Размер интерфейса</h2><p>Увеличивает текст, кнопки и панели. Общий экран игроков сохраняет свой масштаб.</p><label>Масштаб интерфейса<select aria-label="Масштаб интерфейса в настройках" value={uiScale} onChange={e => setUiScale(Number(e.target.value))}>{[80,90,100,110,125,150].map(value => <option key={value} value={value}>{value}%</option>)}</select></label><button onClick={() => setUiScale(100)}>Вернуть 100%</button></section><section className="editor-card"><h2>Общий экран</h2><p>Показывайте готовую сцену в отдельном окне.</p>{desktopAvailable ? <><label>Монитор<select value={monitor} onChange={e => setMonitor(Number(e.target.value))}>{monitors.map(item => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label><button onClick={() => void openDisplay()}>Открыть на выбранном мониторе</button><button onClick={() => { const next = !fullscreen; void (window.desktop ? window.desktop.fullscreen(next) : api('/api/desktop/display', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ monitorId: monitor, fullscreen: next }) })).then(() => setFullscreen(next)).catch(err => setError(err.message)); }}>{fullscreen ? 'Вернуть оконный режим' : 'Включить полный экран'}</button></> : <button onClick={() => void openDisplay()}>Открыть общий экран в браузере ↗</button>}{live && <button disabled={busy} onClick={() => command('project.stop')}>Завершить эфир «{live.name}»</button>}</section></div>}
+      {page === 'music' && <><MusicEditor key={project.id} project={project} music={state.music} spotify={state.spotify || null} command={command} upload={importAudio} busy={busy} error={audioError} api={api} root={isRoot}/><Soundboard project={project} command={command} busy={busy}/></>}
+      {page === 'settings' && <div className="settings-grid"><section className="editor-card"><h2>Горячие клавиши</h2><p>Ctrl + Shift + P — предпросмотр.<br/>Ctrl + Shift + L — вывести текущий проект в эфир.<br/>Ctrl + Shift + → — следующий ход.<br/>Ctrl + Shift + Z — отменить последнее изменение ХП.</p><p>Не срабатывают при наборе текста.</p></section><section className="editor-card"><h2>Цветовая схема</h2><p>Действует на этом компьютере, вместе с общим экраном в отдельном окне. Игроки выбирают схему у себя на телефоне; телевизор по сети видит схему по умолчанию.</p><label>Схема<select aria-label="Цветовая схема" value={theme} onChange={e => setTheme(e.target.value as ThemeId)}>{themes.map(item => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label></section><section className="editor-card"><h2>Размер интерфейса</h2><p>Увеличивает текст, кнопки и панели. Общий экран игроков сохраняет свой масштаб.</p><label>Масштаб интерфейса<select aria-label="Масштаб интерфейса в настройках" value={uiScale} onChange={e => setUiScale(Number(e.target.value))}>{[80,90,100,110,125,150].map(value => <option key={value} value={value}>{value}%</option>)}</select></label><button onClick={() => setUiScale(100)}>Вернуть 100%</button></section><section className="editor-card"><h2>Общий экран</h2><p>Показывайте готовую сцену в отдельном окне.</p>{desktopAvailable ? <><label>Монитор<select value={monitor} onChange={e => setMonitor(Number(e.target.value))}>{monitors.map(item => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label><button onClick={() => void openDisplay()}>Открыть на выбранном мониторе</button><button onClick={() => { const next = !fullscreen; void (window.desktop ? window.desktop.fullscreen(next) : api('/api/desktop/display', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ monitorId: monitor, fullscreen: next }) })).then(() => setFullscreen(next)).catch(err => setError(err.message)); }}>{fullscreen ? 'Вернуть оконный режим' : 'Включить полный экран'}</button></> : <button onClick={() => void openDisplay()}>Открыть общий экран в браузере ↗</button>}{live && <button disabled={busy} onClick={() => command('project.stop')}>Завершить эфир «{live.name}»</button>}</section></div>}
     </main><aside className="studio-navigation"><nav role="tablist" aria-label="Разделы мастерской" aria-orientation="vertical">{pages.map(item => <button role="tab" id={`nav-${item.id}`} aria-selected={page === item.id} aria-controls="editor-panel" key={item.id} onClick={() => setPage(item.id)} onKeyDown={e => { const index = pages.findIndex(p => p.id === item.id); const next = e.key === 'ArrowDown' ? (index + 1) % pages.length : e.key === 'ArrowUp' ? (index + pages.length - 1) % pages.length : -1; if (next >= 0) { e.preventDefault(); setPage(pages[next].id); document.getElementById(`nav-${pages[next].id}`)?.focus(); } }}><span className="nav-icon">{item.icon}</span><span><strong>{item.title}</strong><small>{item.description}</small></span></button>)}</nav><div className="rail-scale"><label>Размер интерфейса<select aria-label="Масштаб интерфейса" value={uiScale} onChange={e => setUiScale(Number(e.target.value))}>{[80,90,100,110,125,150].map(value => <option key={value} value={value}>{value}%</option>)}</select></label><small>Сохраняется на этом устройстве</small></div></aside></div>
+    <nav className="studio-mobile-tabs" aria-label="Пульт мастера">{pages.filter(item => ['preview','combat','character'].includes(item.id)).map(item => <button type="button" id={`mobile-nav-${item.id}`} key={item.id} aria-pressed={page === item.id} onClick={() => setPage(item.id)}><span aria-hidden="true">{item.icon}</span>{item.id === 'preview' ? 'Стол' : item.title}</button>)}<button type="button" aria-expanded={mobileMenu} aria-controls="studio-mobile-menu" onClick={() => setMobileMenu(value => !value)}><span aria-hidden="true">☰</span>Разделы</button></nav>
+    {mobileMenu && <div className="studio-mobile-menu" id="studio-mobile-menu"><div><strong>Разделы мастерской</strong><button type="button" onClick={() => setMobileMenu(false)} aria-label="Закрыть разделы">×</button></div><nav>{pages.map(item => <button type="button" key={item.id} aria-pressed={page === item.id} onClick={() => { setPage(item.id); setMobileMenu(false); }}><span aria-hidden="true">{item.icon}</span>{item.title}</button>)}</nav></div>}
   </div>;
 }

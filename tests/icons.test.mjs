@@ -22,6 +22,6 @@ test('Card icons persist, reach Display, travel in archives and reset without af
     const file = join(target,'icons.zip'); await writeProjectArchive(project,directory,resolve('public'),file); const restored = await readProjectArchive(file,target); assert.deepEqual(readFileSync(join(target,restored.project.icons.heart)),png);
     const bad = await fetch(`${origin}/api/icon?projectId=${projectId}&kind=heart`,{ method:'POST',headers,body:readFileSync('public/assets/heart.svg') }); assert.equal(bad.status,400);
     assert.throws(() => service.store.execute({ id:randomUUID(),type:'icon.import',projectId,kind:'heart' }));
-    service.store.execute({ id:randomUUID(),type:'icon.reset',projectId,kind:'heart' }); assert.equal(service.store.state().projects[0].icons.heart,'/assets/heart.svg'); assert.equal(service.store.state().projects[0].games.aristocrat.hp,hp);
+    service.store.execute({ id:randomUUID(),type:'icon.reset',projectId,kind:'heart' }); assert.equal(service.store.state().projects[0].icons.heart,'/assets/heart.png'); assert.equal(service.store.state().projects[0].games.aristocrat.hp,hp);
   } finally { service.close(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); for (const dir of [directory,target]) rmSync(dir,{ recursive:true,force:true,maxRetries:5,retryDelay:100 }); }
 });

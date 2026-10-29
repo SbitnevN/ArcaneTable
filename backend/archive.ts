@@ -1,4 +1,6 @@
-﻿import { validShop } from '../src/shop-view.js';
+﻿import { validInventoryItem, validItem, validSpell, validWeapon } from '../src/library.js';
+import { validArtwork } from '../src/shop-view.js';
+import { validShop } from '../src/shop-view.js';
 import { ZipFile as Writer } from 'yazl';
 import { open, type ZipFile, type Entry } from 'yauzl';
 import { createReadStream, createWriteStream, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, unlinkSync } from 'node:fs';
@@ -6,7 +8,7 @@ import { join, resolve, sep, extname } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { pipeline } from 'node:stream/promises';
 import { Transform, type Readable } from 'node:stream';
-import { defaultIcons, validMonster, validGame, type Project, type Combat } from '../src/contracts.js';
+import { defaultIcons, upgradeIcons, validMonster, validPlan, validGame, type Project, type Combat } from '../src/contracts.js';
 
 function assert(condition: unknown, message = 'Повреждённый или неподдерживаемый архив проекта'): asserts condition { if (!condition) throw new Error(message); }
 const text = (value: unknown, max = 200) => typeof value === 'string' && value.length <= max;
@@ -18,6 +20,8 @@ function validateCombat(combat: Combat | null, project: Project) {
   assert(Array.isArray(combat.participants) && combat.participants.length <= 30 && ids(combat.participants));
   for (const p of combat.participants) assert(text(p.name,100) && ['ally','enemy'].includes(p.side) && (!p.characterId || project.games[p.characterId]) && integer(p.hp,0,1000000) && integer(p.maxHp,1,1000000) && p.hp <= p.maxHp && integer(p.ac,0,1000) && integer(p.initiative,-1000,1000) && ['visible','hideHp','hideAc'].every(key => typeof p[key as keyof typeof p] === 'boolean') && Array.isArray(p.statuses) && p.statuses.length <= 15 && p.statuses.every(s => text(s,100)));
   for (const p of combat.participants) if (p.portrait) validatePortrait(p.portrait);
+  for (const p of combat.participants) assert(p.loot === undefined || Array.isArray(p.loot) && p.loot.length <= 50 && p.loot.every(validInventoryItem));
+  if (combat.loot) assert(Array.isArray(combat.loot.pool) && combat.loot.pool.length <= 1500 && combat.loot.pool.every(validInventoryItem) && Array.isArray(combat.loot.order) && combat.loot.order.every(id => project.games[id]) && integer(combat.loot.turn, 0, 100) && Array.isArray(combat.loot.log) && combat.loot.log.every(line => text(line, 300)));
   const has = (id: string | null) => id === null || combat.participants.some(p => p.id === id);
   assert(has(combat.activeId) && Array.isArray(combat.pending) && combat.pending.length <= 30 && Array.isArray(combat.history) && combat.history.length <= 100 && Array.isArray(combat.events) && combat.events.length <= 200);
   for (const p of combat.pending) assert(text(p.id,100) && has(p.sourceId) && has(p.targetId) && ['damage','heal'].includes(p.kind) && integer(p.amount,1,1000000));
@@ -27,17 +31,21 @@ function validateCombat(combat: Combat | null, project: Project) {
 function validatePortrait(c: import('../src/contracts.js').Character) { assert(c && text(c.name,100) && text(c.image,300) && text(c.caption) && text(c.subtitle) && integer(c.width,1,64000000) && integer(c.height,1,64000000) && c.width * c.height <= 64000000); }
 export function validateProject(project: Project) {
   assert(project && typeof project === 'object' && text(project.name,100) && project.name.trim());
-  project.icons ??= { ...defaultIcons }; assert(project.icons && Object.keys(project.icons).length === 2 && ['heart','shield'].every(key => typeof project.icons[key as keyof typeof project.icons] === 'string' && /^\/(assets\/[\w-]+\.(svg|png)|media\/[a-f0-9-]+\.(png|webp|svg))$/.test(project.icons[key as keyof typeof project.icons])));
+  project.icons ??= { ...defaultIcons }; assert(project.icons && Object.keys(project.icons).length === 2 && ['heart','shield'].every(key => typeof project.icons[key as keyof typeof project.icons] === 'string' && /^\/(assets\/[\w-]+\.(svg|png)|media\/[a-f0-9-]+\.(png|webp|svg))$/.test(project.icons[key as keyof typeof project.icons]))); project.icons = upgradeIcons(project.icons);
   project.shops ??= []; project.activeShopId ??= null; assert(Array.isArray(project.shops) && project.shops.length <= 50 && project.shops.every(validShop) && ids(project.shops) && (project.activeShopId === null || project.shops.some(s => s.id === project.activeShopId)));
   project.dmNotes ??= ''; project.presets ??= []; project.cue ??= null; assert(text(project.dmNotes,100000) && Array.isArray(project.presets) && project.presets.length <= 100 && ids(project.presets));
   for (const p of project.presets) assert(text(p.name,100) && text(p.characterId,100) && (p.sceneId === null || text(p.sceneId,100)));
-  if (project.cue) assert(text(project.cue.id,100) && text(project.cue.label,100) && Number.isFinite(project.cue.expiresAt));
+  if (project.cue) assert(text(project.cue.id,100) && text(project.cue.label,100) && (project.cue.text === undefined || text(project.cue.text,1000)) && (project.cue.expiresAt === null || Number.isFinite(project.cue.expiresAt)));
   for (const layout of [project.layout, project.background, ...project.presets.flatMap(p => [p.layout,p.background])]) assert(layout && Number.isFinite(layout.scale) && layout.scale >= .3 && layout.scale <= 3 && Number.isFinite(layout.x) && layout.x >= 0 && layout.x <= 100 && Number.isFinite(layout.y) && layout.y >= 0 && layout.y <= 100);
   for (const items of [project.characters,project.scenes,project.tracks,project.playlists,project.folders]) assert(Array.isArray(items) && items.length <= 10000 && items.every(item => item && typeof item === 'object') && ids(items));
+  assert(project.edition === undefined || ['2014','2024'].includes(project.edition));
+  project.items ??= []; assert(Array.isArray(project.items) && project.items.length <= 2000 && project.items.every(validItem) && ids(project.items));
+  for (const item of project.items) if (item.artwork) assert(validArtwork(item.artwork));
+  project.spells ??= []; project.weapons ??= []; assert(Array.isArray(project.spells) && project.spells.length <= 2000 && project.spells.every(validSpell) && ids(project.spells) && Array.isArray(project.weapons) && project.weapons.length <= 2000 && project.weapons.every(validWeapon) && ids(project.weapons));
   project.monsters ??= []; assert(Array.isArray(project.monsters) && project.monsters.length <= 1000 && project.monsters.every(validMonster) && ids(project.monsters));
   for (const m of project.monsters) if (m.portrait) validatePortrait(m.portrait);
   assert(project.characters.length >= 1 && project.characters.length <= 200 && project.games && typeof project.games === 'object');
-  for (const c of project.characters) assert(text(c.name,100) && text(c.caption) && text(c.subtitle) && integer(c.width,1,64000000) && integer(c.height,1,64000000) && c.width * c.height <= 64000000 && validGame(project.games[c.id]));
+  for (const c of project.characters) assert(text(c.name,100) && text(c.caption) && text(c.subtitle) && (c.offstage === undefined || typeof c.offstage === 'boolean') && integer(c.width,1,64000000) && integer(c.height,1,64000000) && c.width * c.height <= 64000000 && validGame(project.games[c.id]));
   assert(project.characters.some(c => c.id === project.selectedCharacter));
   const playlist = (id: unknown) => id === undefined || id === null || project.playlists.some(p => p.id === id);
   const folder = (id: unknown) => id === undefined || id === null || project.folders.some(f => f.id === id);
@@ -50,9 +58,10 @@ export function validateProject(project: Project) {
     while (current) { assert(!visited.has(current.id), 'Цикл в папках архива'); visited.add(current.id); current = project.folders.find(item => item.id === current!.parentId); }
   }
   assert(playlist(project.playlistId) && (project.sceneId === null || project.scenes.some(s => s.id === project.sceneId)));
+  project.plans ??= []; assert(Array.isArray(project.plans) && project.plans.length <= 200 && project.plans.every(validPlan) && ids(project.plans));
   assert(Array.isArray(project.encounters) && project.encounters.length <= 100); validateCombat(project.combat, project); for (const c of project.encounters) validateCombat(c,project);
 }
-function portraits(project: Project) { return [...project.shops.flatMap(s => [...(s.artwork ? [s.artwork] : []), ...s.items.flatMap(i => i.artwork ? [i.artwork] : [])]), ...project.characters, ...project.monsters.flatMap(m => m.portrait ? [m.portrait] : []), ...[project.combat,...project.encounters].flatMap(c => c?.participants.flatMap(p => p.portrait ? [p.portrait] : []) || [])]; }
+function portraits(project: Project) { return [...Object.values(project.games).flatMap(g => (g.items || []).flatMap(i => i.artwork ? [i.artwork] : [])), ...project.monsters.flatMap(m => (m.loot || []).flatMap(i => i.artwork ? [i.artwork] : [])), ...(project.plans || []).flatMap(p => p.enemies.flatMap(e => e.loot.flatMap(i => i.artwork ? [i.artwork] : []))), ...[project.combat, ...project.encounters].flatMap(c => [...(c?.participants || []).flatMap(p => p.loot || []), ...(c?.loot?.pool || [])].flatMap(i => i.artwork ? [i.artwork] : [])), ...(project.items || []).flatMap(i => i.artwork ? [i.artwork] : []), ...project.shops.flatMap(s => [...(s.artwork ? [s.artwork] : []), ...s.items.flatMap(i => i.artwork ? [i.artwork] : [])]), ...project.characters, ...project.monsters.flatMap(m => m.portrait ? [m.portrait] : []), ...[project.combat,...project.encounters].flatMap(c => c?.participants.flatMap(p => p.portrait ? [p.portrait] : []) || [])]; }
 const references = (project: Project) => [...Object.values(project.icons), ...project.scenes.map(s => s.url), ...project.tracks.map(t => t.url), ...portraits(project).map(c => c.image)];
 async function hashFile(filename: string) { const hash = createHash('sha256'); for await (const chunk of createReadStream(filename)) hash.update(chunk); return hash.digest('hex'); }
 

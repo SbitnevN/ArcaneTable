@@ -16,6 +16,7 @@ export default defineConfig({
           if (address && typeof address !== 'string') {
             const url = `http://127.0.0.1:${address.port}/?master=${service.master}`;
             writeFileSync(resolve('.arcane-data/dev-session-url.txt'), url);
+            writeFileSync(resolve('.arcane-data/agent.json'), JSON.stringify({ origin: `http://127.0.0.1:${address.port}`, token: service.master, pid: process.pid }));
             console.log(`\nПанель мастера: ${url}\n`);
           }
         });
