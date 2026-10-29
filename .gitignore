@@ -4,3 +4,4 @@ dist/
 
 .arcane-data/
 build-desktop/
+output/
